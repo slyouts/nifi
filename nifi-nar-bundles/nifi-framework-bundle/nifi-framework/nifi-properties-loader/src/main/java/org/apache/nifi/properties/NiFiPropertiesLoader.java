@@ -225,6 +225,16 @@ public class NiFiPropertiesLoader {
             return loadDefault();
         }
     }
+    
+    public NiFiProperties get(Properties rawProperties) {
+        ProtectedNiFiProperties protectedNiFiProperties = new ProtectedNiFiProperties(rawProperties);
+        if (protectedNiFiProperties.hasProtectedKeys()) {
+            Security.addProvider(new BouncyCastleProvider());
+            protectedNiFiProperties.addSensitivePropertyProvider(getSensitivePropertyProvider());
+        }
+
+        return protectedNiFiProperties.getUnprotectedProperties();
+    }
 
     /**
      * Returns the loaded {@link NiFiProperties} instance. If none is currently

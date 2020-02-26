@@ -49,6 +49,7 @@
         <module>nifi-mock-authorizer</module>
         <module>nifi-shell-authorizer</module>
         <module>nifi-stateless</module>
+        <module>nifi-transactional</module>
     </modules>
     <dependencies>
         <dependency>

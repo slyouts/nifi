@@ -43,7 +43,7 @@ public class ExtensionMapping {
         processorNames.computeIfAbsent(processorName, name -> new HashSet<>()).add(coordinate);
     }
 
-    void addAllProcessors(final BundleCoordinate coordinate, final Collection<String> processorNames) {
+    public void addAllProcessors(final BundleCoordinate coordinate, final Collection<String> processorNames) {
         processorNames.forEach(name -> {
             addProcessor(coordinate, name);
         });
@@ -53,7 +53,7 @@ public class ExtensionMapping {
         controllerServiceNames.computeIfAbsent(controllerServiceName, name -> new HashSet<>()).add(coordinate);
     }
 
-    void addAllControllerServices(final BundleCoordinate coordinate, final Collection<String> controllerServiceNames) {
+    public void addAllControllerServices(final BundleCoordinate coordinate, final Collection<String> controllerServiceNames) {
         controllerServiceNames.forEach(name -> {
             addControllerService(coordinate, name);
         });
@@ -63,13 +63,13 @@ public class ExtensionMapping {
         reportingTaskNames.computeIfAbsent(reportingTaskName, name -> new HashSet<>()).add(coordinate);
     }
 
-    void addAllReportingTasks(final BundleCoordinate coordinate, final Collection<String> reportingTaskNames) {
+    public void addAllReportingTasks(final BundleCoordinate coordinate, final Collection<String> reportingTaskNames) {
         reportingTaskNames.forEach(name -> {
             addReportingTask(coordinate, name);
         });
     }
 
-    void merge(final ExtensionMapping other) {
+    public void merge(final ExtensionMapping other) {
         other.getProcessorNames().forEach((name, otherCoordinates) -> {
             processorNames.merge(name, otherCoordinates, merger);
         });
