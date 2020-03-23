@@ -175,7 +175,6 @@ public class TransactionalReloadComponent implements ReloadComponent {
 
         // set the new impl, proxy, and invocation handler into the existing node
         existingNode.setControllerServiceAndProxy(loggableImplementation, loggableProxy, invocationHandler);
-        existingNode.setExtensionMissing(newNode.isExtensionMissing());
 
         // need to refresh the properties in case we are changing from ghost component to real component
         existingNode.refreshProperties();

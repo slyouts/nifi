@@ -172,7 +172,7 @@ public class ExtensionBuilder {
         return this;
     }
 
-    public ProcessorNode buildProcessor() {
+    public ProcessorNode buildProcessor() throws ProcessorInstantiationException {
         if (identifier == null) {
             throw new IllegalStateException("Processor ID must be specified");
         }
@@ -195,25 +195,10 @@ public class ExtensionBuilder {
             throw new IllegalStateException("Reload Component must be specified");
         }
 
-        boolean creationSuccessful = true;
         LoggableComponent<Processor> loggableComponent;
-        try {
-            loggableComponent = createLoggableProcessor();
-        } catch (final ProcessorInstantiationException pie) {
-            logger.error("Could not create Processor of type " + type + " for ID " + identifier + " due to: " + pie.getMessage()
-                    + "; creating \"Ghost\" implementation");
-            if (logger.isDebugEnabled()) {
-                logger.debug(pie.getMessage(), pie);
-            }
+        loggableComponent = createLoggableProcessor();
 
-            final GhostProcessor ghostProc = new GhostProcessor();
-            ghostProc.setIdentifier(identifier);
-            ghostProc.setCanonicalClassName(type);
-            loggableComponent = new LoggableComponent<>(ghostProc, bundleCoordinate, null);
-            creationSuccessful = false;
-        }
-
-        final ProcessorNode processorNode = createProcessorNode(loggableComponent, creationSuccessful);
+        final ProcessorNode processorNode = createProcessorNode(loggableComponent);
         return processorNode;
     }
 
@@ -287,20 +272,13 @@ public class ExtensionBuilder {
         return createControllerServiceNode();
     }
 
-    private ProcessorNode createProcessorNode(final LoggableComponent<Processor> processor, final boolean creationSuccessful) {
+    private ProcessorNode createProcessorNode(final LoggableComponent<Processor> processor) {
         final ComponentVariableRegistry componentVarRegistry = new StandardComponentVariableRegistry(this.variableRegistry);
         final ValidationContextFactory validationContextFactory = new StandardValidationContextFactory(serviceProvider, componentVarRegistry);
 
         final ProcessorNode procNode;
-        if (creationSuccessful) {
-            procNode = new StandardProcessorNode(processor, identifier, validationContextFactory, processScheduler, serviceProvider,
-                    componentVarRegistry, reloadComponent, extensionManager, validationTrigger);
-        } else {
-            final String simpleClassName = type.contains(".") ? StringUtils.substringAfterLast(type, ".") : type;
-            final String componentType = "(Missing) " + simpleClassName;
-            procNode = new StandardProcessorNode(processor, identifier, validationContextFactory, processScheduler, serviceProvider, componentType,
-                    type, componentVarRegistry, reloadComponent, extensionManager, validationTrigger, true);
-        }
+        procNode = new StandardProcessorNode(processor, identifier, validationContextFactory, processScheduler, serviceProvider, componentVarRegistry,
+                reloadComponent, extensionManager, validationTrigger);
 
         applyDefaultSettings(procNode);
         return procNode;
@@ -311,14 +289,14 @@ public class ExtensionBuilder {
         final ValidationContextFactory validationContextFactory = new StandardValidationContextFactory(serviceProvider, componentVarRegistry);
         final ReportingTaskNode taskNode;
         if (creationSuccessful) {
-            taskNode = new StandardReportingTaskNode(reportingTask, identifier, flowController, processScheduler, validationContextFactory,
+            taskNode = new TransactionalReportingTaskNode(reportingTask, identifier, flowController, processScheduler, validationContextFactory,
                     componentVarRegistry, reloadComponent, extensionManager, validationTrigger);
             taskNode.setName(taskNode.getReportingTask().getClass().getSimpleName());
         } else {
             final String simpleClassName = type.contains(".") ? StringUtils.substringAfterLast(type, ".") : type;
             final String componentType = "(Missing) " + simpleClassName;
 
-            taskNode = new StandardReportingTaskNode(reportingTask, identifier, flowController, processScheduler, validationContextFactory,
+            taskNode = new TransactionalReportingTaskNode(reportingTask, identifier, flowController, processScheduler, validationContextFactory,
                     componentType, type, componentVarRegistry, reloadComponent, extensionManager, validationTrigger, true);
             taskNode.setName(componentType);
         }

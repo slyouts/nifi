@@ -31,6 +31,7 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -83,6 +84,7 @@ import org.apache.nifi.controller.FlowController;
 import org.apache.nifi.controller.MissingBundleException;
 import org.apache.nifi.controller.ProcessorNode;
 import org.apache.nifi.controller.ReloadComponent;
+import org.apache.nifi.controller.ReportingTaskNode;
 import org.apache.nifi.controller.ScheduledState;
 import org.apache.nifi.controller.StandardFlowSynchronizer;
 import org.apache.nifi.controller.Template;
@@ -106,6 +108,7 @@ import org.apache.nifi.controller.service.ControllerServiceProvider;
 import org.apache.nifi.controller.state.manager.StandardStateManagerProvider;
 import org.apache.nifi.encrypt.StringEncryptor;
 import org.apache.nifi.engine.FlowEngine;
+import org.apache.nifi.events.VolatileBulletinRepository;
 import org.apache.nifi.flowfile.FlowFilePrioritizer;
 import org.apache.nifi.groups.ProcessGroup;
 import org.apache.nifi.groups.RemoteProcessGroup;
@@ -179,6 +182,7 @@ import org.apache.nifi.registry.variable.StandardComponentVariableRegistry;
 import org.apache.nifi.remote.PublicPort;
 import org.apache.nifi.remote.RemoteGroupPort;
 import org.apache.nifi.remote.protocol.SiteToSiteTransportProtocol;
+import org.apache.nifi.reporting.BulletinRepository;
 import org.apache.nifi.reporting.InitializationException;
 import org.apache.nifi.reporting.ReportingTask;
 import org.apache.nifi.scheduling.ExecutionNode;
@@ -222,27 +226,13 @@ public class TransactionalFlow implements RunnableFlow {
 
     private static final Logger logger = LoggerFactory.getLogger(TransactionalFlow.class);
 
-    private List<TransactionalComponent> roots;
-    private volatile boolean stopRequested = false;
     private TransactionalComponent sourceComponent = null;
 
-    private final ComponentFactory componentFactory;
     private StateManagerProvider stateManagerProvider;
 
-    public TransactionalFlow(final TransactionalProcessorWrapper root) {
-        this(Collections.singletonList(root));
-    }
-
-    public TransactionalFlow(final List<TransactionalComponent> roots) {
-        this.roots = roots;
-        this.componentFactory = null;
-    }
-
-    public TransactionalFlow(TransactionalProcessGroup rootGroup, ExtensionManager extensionManager, SSLContext sslContext,
+    public TransactionalFlow(TransactionalFlowManager flowManager, ExtensionManager extensionManager, SSLContext sslContext,
             Map<String, ParameterContext> paramaterContexts, StateManagerProvider stateManagerProvider, VariableRegistry baseVarRegistry,
             StringEncryptor encryptor) {
-
-        this.componentFactory = new ComponentFactory(extensionManager);
 
         final Map<String, VersionedProcessor> processors = findProcessorsRecursive(flow).stream()
                 .collect(Collectors.toMap(VersionedProcessor::getIdentifier, proc -> proc));
@@ -576,8 +566,7 @@ public class TransactionalFlow implements RunnableFlow {
 
     static void createControllerService(final Element cse, final StringEncryptor encryptor, final FlowEncodingVersion encodingVersion,
             final TransactionalProcessGroup processGroup, final ControllerServiceProvider serviceProvider, final List<ControllerServiceDTO> dtos,
-            final TransactionalFlowManager flowManager)
-            throws ClassNotFoundException, IllegalAccessException, InstantiationException, InitializationException {
+            final TransactionalFlowManager flowManager) {
 
         ControllerServiceDTO csDTO = FlowFromDOMFactory.getControllerService(cse, encryptor, encodingVersion);
         dtos.add(csDTO);
@@ -589,7 +578,6 @@ public class TransactionalFlow implements RunnableFlow {
 
         serviceNode.setComments(csDTO.getComments());
         serviceNode.setName(csDTO.getName());
-        serviceProvider.onControllerServiceAdded(serviceNode);
         if (Objects.nonNull(processGroup)) {
             serviceNode.setVersionedComponentId(csDTO.getVersionedComponentId());
             processGroup.addControllerService(serviceNode);
@@ -644,7 +632,9 @@ public class TransactionalFlow implements RunnableFlow {
 
             TransactionalProcessScheduler scheduler = new TransactionalProcessScheduler(timerDrivenEngineRef, encryptor, stateManagerProvider,
                     extensionManager, properties);
-            TransactionalControllerServiceProvider serviceProvider = new TransactionalControllerServiceProvider(extensionManager, scheduler);
+
+            BulletinRepository bulletinRepo = new VolatileBulletinRepository();
+            TransactionalControllerServiceProvider serviceProvider = new TransactionalControllerServiceProvider(extensionManager, scheduler, bulletinRepo);
             FlowFileEventRepository flowFileEventRepository = new RingBufferEventRepository(5);
             TransactionalReloadComponent reloadComponent = new TransactionalReloadComponent(extensionManager, baseVarRegistry, serviceProvider,
                     stateManagerProvider, validationTrigger, encryptor);
@@ -684,6 +674,7 @@ public class TransactionalFlow implements RunnableFlow {
             // get the process groups...this recurses down through the child ProcessGroups
             final TransactionalProcessGroup rootGroup = addProcessGroup(flowManager, null, rootGroupElement, encryptor, encodingVersion,
                     serviceProvider, extensionManager);
+
             // need to build the controller level controller services...these are the ones used by ReportingTasks
             final Element controllerServicesElement = DomUtils.getChild(rootElement, "controllerServices");
             if (controllerServicesElement != null) {
@@ -717,13 +708,23 @@ public class TransactionalFlow implements RunnableFlow {
                         .forEach(rte -> taskElements.add(FlowFromDOMFactory.getReportingTask(rte, encryptor, encodingVersion)));
                 taskElements.forEach(rtDTO -> {
                     StateManager stateManager = stateManagerProvider.getStateManager(rtDTO.getId());
-                    ReportingTask reptTask = cf.createReportingTask(rtDTO, baseVarRegistry, serviceLookup, stateManager, ParameterLookup.EMPTY);
-
+                    String type = rtDTO.getType();
+                    BundleDTO bundleDTO = rtDTO.getBundle();
+                    BundleCoordinate bundleCoordinate = new BundleCoordinate(bundleDTO.getGroup(), bundleDTO.getArtifact(), bundleDTO.getVersion());
+                    ReportingTaskNode reportingTask = flowManager.createReportingTask(type, bundleCoordinate, true);
+                    reportingTask.setName(rtDTO.getName());
+                    reportingTask.setComments(rtDTO.getComments());
+                    reportingTask.setSchedulingPeriod(rtDTO.getSchedulingPeriod());
+                    reportingTask.setSchedulingStrategy(SchedulingStrategy.valueOf(rtDTO.getSchedulingStrategy()));
+                    reportingTask.setAnnotationData(rtDTO.getAnnotationData());
+                    reportingTask.setProperties(rtDTO.getProperties());
                 });
             }
-            serviceLookup.enableControllerServices(baseVarRegistry);
+            Collection<ControllerServiceNode> services = flowManager.getRootControllerServices();
+            services.forEach(ControllerServiceNode::performValidation); // validate services before attempting to enable them
+            serviceProvider.enableControllerServices(services);
 
-            final TransactionalFlow flow = new TransactionalFlow(rootGroup, extensionManager, sslContext, paramaterContexts, stateManagerProvider,
+            final TransactionalFlow flow = new TransactionalFlow(flowManager, extensionManager, sslContext, paramaterContexts, stateManagerProvider,
                     baseVarRegistry, encryptor);
         } catch (Exception e) {
             throw new FlowSerializationException(e);
@@ -742,7 +743,6 @@ public class TransactionalFlow implements RunnableFlow {
             args.getAsJsonArray(FAILUREPORTS).forEach(port -> failurePorts.add(port.getAsString()));
         }
 
-        final SSLContext sslContext = getSSLContext();
         final VersionedFlowSnapshot snapshot = new RegistryUtil(registryurl, sslContext).getFlowByID(bucketID, flowID, flowVersion);
 
         final Map<VariableDescriptor, String> inputVariables = new HashMap<>();
@@ -927,6 +927,7 @@ public class TransactionalFlow implements RunnableFlow {
         final List<Element> serviceNodeList = getChildrenByTagName(processGroupElement, "controllerService");
         if (!serviceNodeList.isEmpty()) {
             List<ControllerServiceDTO> dtos = new ArrayList<>();
+            List<ControllerServiceNode> services = new ArrayList<>();
             try {
                 for (Element serviceNode : serviceNodeList) {
                     createControllerService(serviceNode, encryptor, encodingVersion, processGroup, serviceProvider, dtos, flowManager);
@@ -937,15 +938,15 @@ public class TransactionalFlow implements RunnableFlow {
                 dtos.forEach(dto -> {
                     final String serviceId = dto.getId();
                     ControllerServiceNode csn = serviceProvider.getControllerServiceNode(serviceId);
+                    services.add(csn);
                     csn.setAnnotationData(dto.getAnnotationData());
                     csn.setProperties(dto.getProperties()); // this will cause a reload and expanding of classLoader if need be
                 });
             } finally {
-                dtos.forEach(csDTO -> {
-                    ControllerServiceNode csn = serviceProvider.getControllerServiceNode(csDTO.getId());
-                    csn.resumeValidationTrigger();
-                });
+                services.forEach(ControllerServiceNode::resumeValidationTrigger);
             }
+            services.forEach(ControllerServiceNode::performValidation); // validate services before attempting to enable them
+            serviceProvider.enableControllerServices(services);
         }
 
         // add processors
@@ -1240,13 +1241,6 @@ public class TransactionalFlow implements RunnableFlow {
             }
 
             processGroup.addConnection(connection);
-        }
-
-        final List<Element> templateNodeList = getChildrenByTagName(processGroupElement, "template");
-        for (final Element templateNode : templateNodeList) {
-            final TemplateDTO templateDTO = TemplateUtils.parseDto(templateNode);
-            final Template template = new Template(templateDTO);
-            processGroup.addTemplate(template);
         }
 
         return processGroup;

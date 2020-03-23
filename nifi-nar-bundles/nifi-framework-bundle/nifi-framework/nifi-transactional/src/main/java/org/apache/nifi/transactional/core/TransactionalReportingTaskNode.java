@@ -30,6 +30,9 @@ import org.apache.nifi.controller.ProcessScheduler;
 import org.apache.nifi.controller.ReloadComponent;
 import org.apache.nifi.controller.ReportingTaskNode;
 import org.apache.nifi.controller.ValidationContextFactory;
+import org.apache.nifi.controller.flow.FlowManager;
+import org.apache.nifi.controller.reporting.AbstractReportingTaskNode;
+import org.apache.nifi.controller.service.ControllerServiceProvider;
 import org.apache.nifi.nar.ExtensionManager;
 import org.apache.nifi.parameter.ParameterContext;
 import org.apache.nifi.registry.ComponentVariableRegistry;
@@ -38,21 +41,19 @@ import org.apache.nifi.reporting.ReportingTask;
 
 public class TransactionalReportingTaskNode extends AbstractReportingTaskNode implements ReportingTaskNode {
 
-    public TransactionalReportingTaskNode(final LoggableComponent<ReportingTask> reportingTask, final String id, final FlowController controller,
+    public TransactionalReportingTaskNode(final LoggableComponent<ReportingTask> reportingTask, final String id, final FlowManager manager,
                                      final ProcessScheduler processScheduler, final ValidationContextFactory validationContextFactory,
                                      final ComponentVariableRegistry variableRegistry, final ReloadComponent reloadComponent, final ExtensionManager extensionManager,
-                                     final ValidationTrigger validationTrigger) {
-        super(reportingTask, id, controller.getControllerServiceProvider(), processScheduler, validationContextFactory, variableRegistry, reloadComponent, extensionManager, validationTrigger);
-        this.flowController = controller;
+                                     final ValidationTrigger validationTrigger, final ControllerServiceProvider controllerServiceProvider) {
+        super(reportingTask, id, controllerServiceProvider, processScheduler, validationContextFactory, variableRegistry, reloadComponent, extensionManager, validationTrigger);
     }
 
     public TransactionalReportingTaskNode(final LoggableComponent<ReportingTask> reportingTask, final String id, final FlowController controller,
                                      final ProcessScheduler processScheduler, final ValidationContextFactory validationContextFactory,
                                      final String componentType, final String canonicalClassName, final ComponentVariableRegistry variableRegistry,
-                                     final ReloadComponent reloadComponent, final ExtensionManager extensionManager, final ValidationTrigger validationTrigger, final boolean isExtensionMissing) {
+                                     final ReloadComponent reloadComponent, final ExtensionManager extensionManager, final ValidationTrigger validationTrigger) {
         super(reportingTask, id, controller.getControllerServiceProvider(), processScheduler, validationContextFactory, componentType, canonicalClassName,
-            variableRegistry, reloadComponent, extensionManager, validationTrigger, isExtensionMissing);
-        this.flowController = controller;
+            variableRegistry, reloadComponent, extensionManager, validationTrigger, false);
     }
 
     @Override

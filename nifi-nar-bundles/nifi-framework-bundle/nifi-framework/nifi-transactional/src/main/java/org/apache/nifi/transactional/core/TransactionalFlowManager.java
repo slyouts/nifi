@@ -404,9 +404,8 @@ public class TransactionalFlowManager implements FlowManager {
 
         final ProcessorNode procNode = new ExtensionBuilder().identifier(id).type(type).bundleCoordinate(coordinate)
                 .extensionManager(extensionManager).controllerServiceProvider(serviceProvider).processScheduler(processScheduler)
-                .validationTrigger(validationTrigger).reloadComponent(reloadComponent)
-                .variableRegistry(variableRegistry).addClasspathUrls(additionalUrls)
-                .kerberosConfig(kerberosConfig).stateManagerProvider(stateManagementProvider).buildProcessor();
+                .validationTrigger(validationTrigger).reloadComponent(reloadComponent).variableRegistry(variableRegistry)
+                .addClasspathUrls(additionalUrls).kerberosConfig(kerberosConfig).stateManagerProvider(stateManagementProvider).buildProcessor();
 
         LogRepositoryFactory.getRepository(procNode.getIdentifier()).setLogger(procNode.getLogger());
         if (registerLogObserver) {
@@ -569,14 +568,11 @@ public class TransactionalFlowManager implements FlowManager {
 
         // make sure the first reference to LogRepository happens outside of a NarCloseable so that we use the framework's ClassLoader
         final LogRepository logRepository = LogRepositoryFactory.getRepository(id);
-        final ExtensionManager extensionManager = extensionManager;
 
         final ReportingTaskNode taskNode = new ExtensionBuilder().identifier(id).type(type).bundleCoordinate(bundleCoordinate)
                 .extensionManager(extensionManager).controllerServiceProvider(serviceProvider).processScheduler(processScheduler)
-                .nodeTypeProvider(flowController).validationTrigger(flowController.getValidationTrigger())
-                .reloadComponent(flowController.getReloadComponent()).variableRegistry(flowController.getVariableRegistry())
-                .addClasspathUrls(additionalUrls).kerberosConfig(flowController.createKerberosConfig(nifiProperties)).flowController(flowController)
-                .extensionManager(extensionManager).buildReportingTask();
+                .validationTrigger(validationTrigger).reloadComponent(reloadComponent).variableRegistry(variableRegistry)
+                .addClasspathUrls(additionalUrls).kerberosConfig(kerberosConfig).extensionManager(extensionManager).buildReportingTask();
 
         LogRepositoryFactory.getRepository(taskNode.getIdentifier()).setLogger(taskNode.getLogger());
 
@@ -587,9 +583,7 @@ public class TransactionalFlowManager implements FlowManager {
             try (final NarCloseable x = NarCloseable.withComponentNarLoader(extensionManager, taskClass, identifier)) {
                 ReflectionUtils.invokeMethodsWithAnnotation(OnAdded.class, taskNode.getReportingTask());
 
-                if (flowController.isInitialized()) {
-                    ReflectionUtils.quietlyInvokeMethodsWithAnnotation(OnConfigurationRestored.class, taskNode.getReportingTask());
-                }
+                ReflectionUtils.quietlyInvokeMethodsWithAnnotation(OnConfigurationRestored.class, taskNode.getReportingTask());
             } catch (final Exception e) {
                 throw new ComponentLifeCycleException("Failed to invoke On-Added Lifecycle methods of " + taskNode.getReportingTask(), e);
             }
@@ -665,38 +659,7 @@ public class TransactionalFlowManager implements FlowManager {
     }
 
     public void removeRootControllerService(final ControllerServiceNode service) {
-        final ControllerServiceNode existing = rootControllerServices.get(requireNonNull(service).getIdentifier());
-        if (existing == null) {
-            throw new IllegalStateException(service + " is not a member of this Process Group");
-        }
-
-        service.verifyCanDelete();
-
-        try (final NarCloseable x = NarCloseable.withComponentNarLoader(extensionManager, service.getControllerServiceImplementation().getClass(),
-                service.getIdentifier())) {
-            final ConfigurationContext configurationContext = new StandardConfigurationContext(service, serviceProvider, null, variableRegistry);
-            ReflectionUtils.quietlyInvokeMethodsWithAnnotation(OnRemoved.class, service.getControllerServiceImplementation(), configurationContext);
-        }
-
-        for (final Map.Entry<PropertyDescriptor, String> entry : service.getEffectivePropertyValues().entrySet()) {
-            final PropertyDescriptor descriptor = entry.getKey();
-            if (descriptor.getControllerServiceDefinition() != null) {
-                final String value = entry.getValue() == null ? descriptor.getDefaultValue() : entry.getValue();
-                if (value != null) {
-                    final ControllerServiceNode referencedNode = getRootControllerService(value);
-                    if (referencedNode != null) {
-                        referencedNode.removeReference(service, descriptor);
-                    }
-                }
-            }
-        }
-
-        rootControllerServices.remove(service.getIdentifier());
-        stateManagementProvider.onComponentRemoved(service.getIdentifier());
-
-        extensionManager.removeInstanceClassLoader(service.getIdentifier());
-
-        logger.info("{} removed from Flow Controller", service);
+        throw new UnsupportedOperationException("removeRootControllerService not supported");
     }
 
     @Override
@@ -715,7 +678,8 @@ public class TransactionalFlowManager implements FlowManager {
             LogRepositoryFactory.getRepository(serviceNode.getIdentifier()).setLogger(serviceNode.getLogger());
             if (registerLogObserver) {
                 // Register log observer to provide bulletins when reporting task logs anything at WARN level or above
-                logRepository.addObserver(StandardProcessorNode.BULLETIN_OBSERVER_ID, LogLevel.WARN, new ControllerServiceLogObserver(bulletinRepository, serviceNode));
+                logRepository.addObserver(StandardProcessorNode.BULLETIN_OBSERVER_ID, LogLevel.WARN,
+                        new ControllerServiceLogObserver(bulletinRepository, serviceNode));
             }
 
             if (firstTimeAdded) {

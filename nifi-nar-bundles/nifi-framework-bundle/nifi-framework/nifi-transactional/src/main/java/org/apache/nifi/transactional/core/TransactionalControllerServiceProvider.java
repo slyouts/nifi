@@ -16,45 +16,6 @@
  */
 package org.apache.nifi.transactional.core;
 
-import org.apache.curator.shaded.com.google.common.base.Optional;
-import org.apache.nifi.annotation.lifecycle.OnDisabled;
-import org.apache.nifi.annotation.lifecycle.OnScheduled;
-import org.apache.nifi.annotation.lifecycle.OnStopped;
-import org.apache.nifi.annotation.lifecycle.OnUnscheduled;
-import org.apache.nifi.components.PropertyDescriptor;
-import org.apache.nifi.components.validation.ValidationStatus;
-import org.apache.nifi.controller.ComponentNode;
-import org.apache.nifi.controller.ConfigurationContext;
-import org.apache.nifi.controller.ControllerService;
-import org.apache.nifi.controller.FlowController;
-import org.apache.nifi.controller.ProcessScheduler;
-import org.apache.nifi.controller.ProcessorNode;
-import org.apache.nifi.controller.ReportingTaskNode;
-import org.apache.nifi.controller.ScheduledState;
-import org.apache.nifi.controller.flow.FlowManager;
-import org.apache.nifi.controller.scheduling.LifecycleState;
-import org.apache.nifi.controller.scheduling.SchedulingAgent;
-import org.apache.nifi.controller.scheduling.StandardProcessScheduler;
-import org.apache.nifi.controller.service.ControllerServiceNode;
-import org.apache.nifi.controller.service.ControllerServiceNotValidException;
-import org.apache.nifi.controller.service.ControllerServiceProvider;
-import org.apache.nifi.controller.service.ControllerServiceState;
-import org.apache.nifi.controller.service.StandardControllerServiceNode;
-import org.apache.nifi.engine.FlowEngine;
-import org.apache.nifi.events.BulletinFactory;
-import org.apache.nifi.groups.ProcessGroup;
-import org.apache.nifi.logging.ComponentLog;
-import org.apache.nifi.logging.LogRepositoryFactory;
-import org.apache.nifi.nar.ExtensionManager;
-import org.apache.nifi.nar.NarCloseable;
-import org.apache.nifi.processor.SimpleProcessLogger;
-import org.apache.nifi.reporting.BulletinRepository;
-import org.apache.nifi.reporting.ReportingTask;
-import org.apache.nifi.reporting.Severity;
-import org.apache.nifi.util.ReflectionUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -65,41 +26,49 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Future;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
-import static java.util.Objects.requireNonNull;
-
-import java.lang.reflect.InvocationTargetException;
+import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.controller.ComponentNode;
+import org.apache.nifi.controller.ControllerService;
+import org.apache.nifi.controller.ProcessorNode;
+import org.apache.nifi.controller.ReportingTaskNode;
+import org.apache.nifi.controller.ScheduledState;
+import org.apache.nifi.controller.flow.FlowManager;
+import org.apache.nifi.controller.service.ControllerServiceNode;
+import org.apache.nifi.controller.service.ControllerServiceNotValidException;
+import org.apache.nifi.controller.service.ControllerServiceProvider;
+import org.apache.nifi.controller.service.ControllerServiceState;
+import org.apache.nifi.events.BulletinFactory;
+import org.apache.nifi.groups.ProcessGroup;
+import org.apache.nifi.nar.ExtensionManager;
+import org.apache.nifi.reporting.BulletinRepository;
+import org.apache.nifi.reporting.Severity;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class TransactionalControllerServiceProvider implements ControllerServiceProvider {
 
     private static final Logger logger = LoggerFactory.getLogger(TransactionalControllerServiceProvider.class);
 
     private final Map<String, ControllerServiceNode> serviceCache = new HashMap<>();
-
-    private final Set<String> controllerLevelServiceIdsCache = new HashSet<>();
-
-    private final ScheduledExecutorService frameworkTaskExecutor;
-
     private final ExtensionManager extensionManager;
-
     private final TransactionalProcessScheduler processScheduler;
+    private final BulletinRepository bulletinRepo;
 
     private TransactionalFlowManager flowManager;
 
-    public TransactionalControllerServiceProvider(final ExtensionManager extensionManager, final TransactionalProcessScheduler processScheduler) {
+    public TransactionalControllerServiceProvider(final ExtensionManager extensionManager, final TransactionalProcessScheduler processScheduler,
+            final BulletinRepository bulletinRepo) {
         this.extensionManager = extensionManager;
-        frameworkTaskExecutor = new FlowEngine(5, "Framework Task Thread");
         this.processScheduler = processScheduler;
         this.processScheduler.setControllerServiceProvider(this);
+        this.bulletinRepo = bulletinRepo;
     }
-    
+
     void setFlowManager(TransactionalFlowManager flowManager) {
         this.flowManager = flowManager;
     }
@@ -107,9 +76,6 @@ public class TransactionalControllerServiceProvider implements ControllerService
     @Override
     public void onControllerServiceAdded(final ControllerServiceNode serviceNode) {
         serviceCache.putIfAbsent(serviceNode.getIdentifier(), serviceNode);
-        if (serviceNode.getProcessGroup() == null) { // its a controller level service
-            controllerLevelServiceIdsCache.add(serviceNode.getIdentifier());
-        }
     }
 
     @Override
@@ -250,6 +216,10 @@ public class TransactionalControllerServiceProvider implements ControllerService
                     logger.warn("Failed to enable service {} because it is not currently valid", controllerServiceNode);
                 } catch (Exception e) {
                     logger.error("Failed to enable " + controllerServiceNode, e);
+                    if (this.bulletinRepo != null) {
+                        this.bulletinRepo.addBulletin(BulletinFactory.createBulletin("Controller Service", Severity.ERROR.name(),
+                                "Could not start " + controllerServiceNode + " due to " + e));
+                    }
                 }
             }
         }
@@ -302,12 +272,21 @@ public class TransactionalControllerServiceProvider implements ControllerService
                             logger.warn("Failed to enable service {}", controllerServiceNode, e);
                             completableFuture.completeExceptionally(e);
 
+                            if (this.bulletinRepo != null) {
+                                this.bulletinRepo.addBulletin(BulletinFactory.createBulletin("Controller Service", Severity.ERROR.name(),
+                                        "Could not enable " + controllerServiceNode + " due to " + e));
+                            }
+
                             return;
                         }
                     }
                 }
             } catch (Exception e) {
                 logger.error("Failed to enable " + controllerServiceNode, e);
+                if (this.bulletinRepo != null) {
+                    this.bulletinRepo.addBulletin(BulletinFactory.createBulletin("Controller Service", Severity.ERROR.name(),
+                            "Could not start " + controllerServiceNode + " due to " + e));
+                }
             }
         }
     }
@@ -383,7 +362,7 @@ public class TransactionalControllerServiceProvider implements ControllerService
     @Override
     public CompletableFuture<Void> disableControllerService(final ControllerServiceNode serviceNode) {
         serviceNode.verifyCanDisable();
-        return serviceNode.disable(this.frameworkTaskExecutor);
+        return processScheduler.disableControllerService(serviceNode);
     }
 
     @Override
@@ -447,13 +426,13 @@ public class TransactionalControllerServiceProvider implements ControllerService
     @Override
     public ControllerService getControllerServiceForComponent(final String serviceIdentifier, final String componentId) {
         // Find the Process Group that owns the component.
-        TransactionalProcessGroup groupOfInterest;
+        ProcessGroup groupOfInterest;
 
         final ProcessorNode procNode = flowManager.getProcessorNode(componentId);
         if (procNode == null) {
             final ControllerServiceNode serviceNode = getControllerServiceNode(componentId);
             if (serviceNode == null) {
-                final ReportingTaskNode taskNode = flowController.getReportingTaskNode(componentId);
+                final ReportingTaskNode taskNode = flowManager.getReportingTaskNode(componentId);
                 if (taskNode == null) {
                     throw new IllegalStateException(
                             "Could not find any Processor, Reporting Task, or Controller Service with identifier " + componentId);
@@ -516,7 +495,7 @@ public class TransactionalControllerServiceProvider implements ControllerService
     public Set<String> getControllerServiceIdentifiers(final Class<? extends ControllerService> serviceType, final String groupId) {
         final Set<ControllerServiceNode> serviceNodes;
         if (groupId == null) {
-            serviceNodes = controllerLevelServiceIdsCache.stream().map((id) -> serviceCache.get(id)).collect(Collectors.toSet());
+            serviceNodes = flowManager.getRootControllerServices();
         } else {
             ProcessGroup group = flowManager.getRootGroup();
             if (!FlowManager.ROOT_GROUP_ID_ALIAS.equals(groupId) && !group.getIdentifier().equals(groupId)) {
@@ -542,20 +521,7 @@ public class TransactionalControllerServiceProvider implements ControllerService
 
     @Override
     public void removeControllerService(final ControllerServiceNode serviceNode) {
-        requireNonNull(serviceNode);
-        serviceCache.remove(serviceNode.getIdentifier());
-
-        final ProcessGroup group = serviceNode.getProcessGroup();
-        if (group == null) {
-            flowManager.removeRootControllerService(serviceNode);
-            return;
-        }
-
-        group.removeControllerService(serviceNode);
-        LogRepositoryFactory.removeRepository(serviceNode.getIdentifier());
-        final ExtensionManager extensionManager = flowController.getExtensionManager();
-        extensionManager.removeInstanceClassLoader(serviceNode.getIdentifier());
-        serviceCache.remove(serviceNode.getIdentifier());
+        throw new UnsupportedOperationException("removeControllerService() not implemented");
     }
 
     @Override
