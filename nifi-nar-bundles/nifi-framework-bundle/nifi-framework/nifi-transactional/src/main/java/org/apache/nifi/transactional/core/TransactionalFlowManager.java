@@ -16,6 +16,24 @@
  */
 package org.apache.nifi.transactional.core;
 
+import static java.util.Objects.requireNonNull;
+
+import java.net.URL;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import javax.net.ssl.SSLContext;
+
 import org.apache.nifi.annotation.lifecycle.OnAdded;
 import org.apache.nifi.annotation.lifecycle.OnConfigurationRestored;
 import org.apache.nifi.annotation.lifecycle.OnRemoved;
@@ -39,10 +57,8 @@ import org.apache.nifi.connectable.Connection;
 import org.apache.nifi.connectable.Funnel;
 import org.apache.nifi.connectable.LocalPort;
 import org.apache.nifi.connectable.Port;
-import org.apache.nifi.controller.ConfigurationContext;
 import org.apache.nifi.controller.ControllerService;
 import org.apache.nifi.controller.FlowSnippet;
-import org.apache.nifi.controller.ProcessScheduler;
 import org.apache.nifi.controller.ProcessorNode;
 import org.apache.nifi.controller.ReloadComponent;
 import org.apache.nifi.controller.ReportingTaskNode;
@@ -55,16 +71,14 @@ import org.apache.nifi.controller.flow.FlowManager;
 import org.apache.nifi.controller.kerberos.KerberosConfig;
 import org.apache.nifi.controller.label.Label;
 import org.apache.nifi.controller.label.StandardLabel;
+import org.apache.nifi.controller.reporting.ReportingTaskInstantiationException;
 import org.apache.nifi.controller.repository.FlowFileEventRepository;
-import org.apache.nifi.controller.scheduling.StandardProcessScheduler;
 import org.apache.nifi.controller.service.ControllerServiceNode;
 import org.apache.nifi.controller.service.ControllerServiceProvider;
-import org.apache.nifi.controller.service.StandardConfigurationContext;
 import org.apache.nifi.events.VolatileBulletinRepository;
 import org.apache.nifi.flowfile.FlowFilePrioritizer;
 import org.apache.nifi.groups.ProcessGroup;
 import org.apache.nifi.groups.RemoteProcessGroup;
-import org.apache.nifi.groups.StandardProcessGroup;
 import org.apache.nifi.logging.ControllerServiceLogObserver;
 import org.apache.nifi.logging.LogLevel;
 import org.apache.nifi.logging.LogRepository;
@@ -76,9 +90,7 @@ import org.apache.nifi.nar.NarCloseable;
 import org.apache.nifi.parameter.Parameter;
 import org.apache.nifi.parameter.ParameterContext;
 import org.apache.nifi.parameter.ParameterContextManager;
-import org.apache.nifi.parameter.ParameterReferenceManager;
-import org.apache.nifi.parameter.StandardParameterContext;
-import org.apache.nifi.parameter.StandardParameterReferenceManager;
+import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.registry.VariableRegistry;
 import org.apache.nifi.registry.variable.MutableVariableRegistry;
 import org.apache.nifi.remote.PublicPort;
@@ -93,22 +105,6 @@ import org.apache.nifi.util.ReflectionUtils;
 import org.apache.nifi.web.api.dto.FlowSnippetDTO;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import javax.net.ssl.SSLContext;
-import java.net.URL;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.function.Function;
-
-import static java.util.Objects.requireNonNull;
 
 public class TransactionalFlowManager implements FlowManager {
     String ROOT_GROUP_ID_ALIAS = "root";
@@ -141,6 +137,7 @@ public class TransactionalFlowManager implements FlowManager {
     private final ConcurrentMap<String, Port> allInputPorts = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Port> allOutputPorts = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Funnel> allFunnels = new ConcurrentHashMap<>();
+    private TransactionalEventAccess eventAccess;
 
     public TransactionalFlowManager(final NiFiProperties nifiProperties, final SSLContext sslContext, final ExtensionManager extensionManager,
             final TransactionalProcessScheduler processScheduler, final StateManagerProvider stateManagementProvider,
@@ -402,37 +399,36 @@ public class TransactionalFlowManager implements FlowManager {
         // make sure the first reference to LogRepository happens outside of a NarCloseable so that we use the framework's ClassLoader
         final LogRepository logRepository = LogRepositoryFactory.getRepository(id);
 
-        final ProcessorNode procNode = new ExtensionBuilder().identifier(id).type(type).bundleCoordinate(coordinate)
-                .extensionManager(extensionManager).controllerServiceProvider(serviceProvider).processScheduler(processScheduler)
-                .validationTrigger(validationTrigger).reloadComponent(reloadComponent).variableRegistry(variableRegistry)
-                .addClasspathUrls(additionalUrls).kerberosConfig(kerberosConfig).stateManagerProvider(stateManagementProvider).buildProcessor();
+        ProcessorNode procNode;
+        try {
+            procNode = new ExtensionBuilder().identifier(id).type(type).bundleCoordinate(coordinate).extensionManager(extensionManager)
+                    .controllerServiceProvider(serviceProvider).processScheduler(processScheduler).validationTrigger(validationTrigger)
+                    .reloadComponent(reloadComponent).variableRegistry(variableRegistry).addClasspathUrls(additionalUrls)
+                    .kerberosConfig(kerberosConfig).stateManagerProvider(stateManagementProvider).buildProcessor();
 
-        LogRepositoryFactory.getRepository(procNode.getIdentifier()).setLogger(procNode.getLogger());
-        if (registerLogObserver) {
-            logRepository.addObserver(StandardProcessorNode.BULLETIN_OBSERVER_ID, procNode.getBulletinLevel(),
-                    new ProcessorLogObserver(bulletinRepository, procNode));
-        }
-
-        if (firstTimeAdded) {
-            try (final NarCloseable x = NarCloseable.withComponentNarLoader(extensionManager, procNode.getProcessor().getClass(),
-                    procNode.getProcessor().getIdentifier())) {
-                ReflectionUtils.invokeMethodsWithAnnotation(OnAdded.class, procNode.getProcessor());
-            } catch (final Exception e) {
-                if (registerLogObserver) {
-                    logRepository.removeObserver(StandardProcessorNode.BULLETIN_OBSERVER_ID);
-                }
-                throw new ComponentLifeCycleException("Failed to invoke @OnAdded methods of " + procNode.getProcessor(), e);
+            LogRepositoryFactory.getRepository(procNode.getIdentifier()).setLogger(procNode.getLogger());
+            if (registerLogObserver) {
+                logRepository.addObserver(StandardProcessorNode.BULLETIN_OBSERVER_ID, procNode.getBulletinLevel(),
+                        new ProcessorLogObserver(bulletinRepository, procNode));
             }
 
-            if (firstTimeAdded && flowController.isInitialized()) {
-                try (final NarCloseable nc = NarCloseable.withComponentNarLoader(extensionManager, procNode.getProcessor().getClass(),
+            if (firstTimeAdded) {
+                try (final NarCloseable x = NarCloseable.withComponentNarLoader(extensionManager, procNode.getProcessor().getClass(),
                         procNode.getProcessor().getIdentifier())) {
+                    ReflectionUtils.invokeMethodsWithAnnotation(OnAdded.class, procNode.getProcessor());
                     ReflectionUtils.quietlyInvokeMethodsWithAnnotation(OnConfigurationRestored.class, procNode.getProcessor());
+                } catch (final Exception e) {
+                    if (registerLogObserver) {
+                        logRepository.removeObserver(StandardProcessorNode.BULLETIN_OBSERVER_ID);
+                    }
+                    throw new ComponentLifeCycleException("Failed to invoke @OnAdded methods of " + procNode.getProcessor(), e);
                 }
             }
-        }
 
-        return procNode;
+            return procNode;
+        } catch (ProcessorInstantiationException e1) {
+            throw new IllegalStateException("Can not instantiate processor " + type);
+        }
     }
 
     public void onProcessorAdded(final ProcessorNode procNode) {
@@ -498,7 +494,13 @@ public class TransactionalFlowManager implements FlowManager {
 
     public Connection createConnection(final String id, final String name, final Connectable source, final Connectable destination,
             final Collection<String> relationshipNames) {
-        return flowController.createConnection(id, name, source, destination, relationshipNames);
+        List<Relationship> rels = relationshipNames.stream().map((rel) -> {
+            Relationship relationship = new Relationship.Builder().name(rel).build();
+            return relationship;
+        }).collect(Collectors.toList());
+        TransactionalConnection connection = new TransactionalConnection.Builder().destination(destination).id(id).name(name).relationships(rels)
+                .source(source).build();
+        return connection;
     }
 
     public Set<Connection> findAllConnections() {
@@ -562,6 +564,7 @@ public class TransactionalFlowManager implements FlowManager {
 
     public ReportingTaskNode createReportingTask(final String type, final String id, final BundleCoordinate bundleCoordinate,
             final Set<URL> additionalUrls, final boolean firstTimeAdded, final boolean register) {
+
         if (type == null || id == null || bundleCoordinate == null) {
             throw new NullPointerException();
         }
@@ -569,35 +572,41 @@ public class TransactionalFlowManager implements FlowManager {
         // make sure the first reference to LogRepository happens outside of a NarCloseable so that we use the framework's ClassLoader
         final LogRepository logRepository = LogRepositoryFactory.getRepository(id);
 
-        final ReportingTaskNode taskNode = new ExtensionBuilder().identifier(id).type(type).bundleCoordinate(bundleCoordinate)
-                .extensionManager(extensionManager).controllerServiceProvider(serviceProvider).processScheduler(processScheduler)
-                .validationTrigger(validationTrigger).reloadComponent(reloadComponent).variableRegistry(variableRegistry)
-                .addClasspathUrls(additionalUrls).kerberosConfig(kerberosConfig).extensionManager(extensionManager).buildReportingTask();
+        ReportingTaskNode taskNode;
+        try {
+            taskNode = new ExtensionBuilder().identifier(id).type(type).bundleCoordinate(bundleCoordinate).extensionManager(extensionManager)
+                    .controllerServiceProvider(serviceProvider).processScheduler(processScheduler).validationTrigger(validationTrigger)
+                    .reloadComponent(reloadComponent).variableRegistry(variableRegistry).addClasspathUrls(additionalUrls)
+                    .kerberosConfig(kerberosConfig).extensionManager(extensionManager).stateManagerProvider(stateManagementProvider)
+                    .buildReportingTask(this, bulletinRepository, eventAccess);
 
-        LogRepositoryFactory.getRepository(taskNode.getIdentifier()).setLogger(taskNode.getLogger());
+            LogRepositoryFactory.getRepository(taskNode.getIdentifier()).setLogger(taskNode.getLogger());
 
-        if (firstTimeAdded) {
-            final Class<?> taskClass = taskNode.getReportingTask().getClass();
-            final String identifier = taskNode.getReportingTask().getIdentifier();
+            if (firstTimeAdded) {
+                final Class<?> taskClass = taskNode.getReportingTask().getClass();
+                final String identifier = taskNode.getReportingTask().getIdentifier();
 
-            try (final NarCloseable x = NarCloseable.withComponentNarLoader(extensionManager, taskClass, identifier)) {
-                ReflectionUtils.invokeMethodsWithAnnotation(OnAdded.class, taskNode.getReportingTask());
+                try (final NarCloseable x = NarCloseable.withComponentNarLoader(extensionManager, taskClass, identifier)) {
+                    ReflectionUtils.invokeMethodsWithAnnotation(OnAdded.class, taskNode.getReportingTask());
 
-                ReflectionUtils.quietlyInvokeMethodsWithAnnotation(OnConfigurationRestored.class, taskNode.getReportingTask());
-            } catch (final Exception e) {
-                throw new ComponentLifeCycleException("Failed to invoke On-Added Lifecycle methods of " + taskNode.getReportingTask(), e);
+                    ReflectionUtils.quietlyInvokeMethodsWithAnnotation(OnConfigurationRestored.class, taskNode.getReportingTask());
+                } catch (final Exception e) {
+                    throw new ComponentLifeCycleException("Failed to invoke On-Added Lifecycle methods of " + taskNode.getReportingTask(), e);
+                }
             }
+
+            if (register) {
+                allReportingTasks.put(id, taskNode);
+
+                // Register log observer to provide bulletins when reporting task logs anything at WARN level or above
+                logRepository.addObserver(StandardProcessorNode.BULLETIN_OBSERVER_ID, LogLevel.WARN,
+                        new ReportingTaskLogObserver(bulletinRepository, taskNode));
+            }
+
+            return taskNode;
+        } catch (ReportingTaskInstantiationException e1) {
+            throw new IllegalStateException("Can not instantiate reporting task " + type);
         }
-
-        if (register) {
-            allReportingTasks.put(id, taskNode);
-
-            // Register log observer to provide bulletins when reporting task logs anything at WARN level or above
-            logRepository.addObserver(StandardProcessorNode.BULLETIN_OBSERVER_ID, LogLevel.WARN,
-                    new ReportingTaskLogObserver(bulletinRepository, taskNode));
-        }
-
-        return taskNode;
     }
 
     public ReportingTaskNode getReportingTaskNode(final String taskId) {
@@ -737,8 +746,11 @@ public class TransactionalFlowManager implements FlowManager {
 
     @Override
     public void instantiateSnippet(ProcessGroup group, FlowSnippetDTO dto) throws ProcessorInstantiationException {
-        // TODO Auto-generated method stub
 
+    }
+
+    public void setEventAccess(TransactionalEventAccess eventAccess) {
+        this.eventAccess = eventAccess;
     }
 
 }

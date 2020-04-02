@@ -16,19 +16,19 @@
  */
 package org.apache.nifi.transactional.core;
 
+import java.io.File;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+
 import org.apache.nifi.controller.ControllerService;
 import org.apache.nifi.controller.ControllerServiceLookup;
 import org.apache.nifi.controller.NodeTypeProvider;
+import org.apache.nifi.controller.kerberos.KerberosConfig;
 import org.apache.nifi.controller.service.ControllerServiceProvider;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.reporting.ReportingInitializationContext;
 import org.apache.nifi.scheduling.SchedulingStrategy;
 import org.apache.nifi.util.FormatUtils;
-import org.apache.nifi.util.NiFiProperties;
-
-import java.io.File;
-import java.util.Set;
-import java.util.concurrent.TimeUnit;
 
 public class TransactionalReportingInitializationContext implements ReportingInitializationContext, ControllerServiceLookup {
 
@@ -52,17 +52,17 @@ public class TransactionalReportingInitializationContext implements ReportingIni
     private final SchedulingStrategy schedulingStrategy;
     private final ControllerServiceProvider serviceProvider;
     private final ComponentLog logger;
-    private final NiFiProperties nifiProperties;
+    private final KerberosConfig kerberosConfig;
 
     public TransactionalReportingInitializationContext(final String id, final String name, final SchedulingStrategy schedulingStrategy, final String schedulingPeriod, final ComponentLog logger,
-            final ControllerServiceProvider serviceProvider, final NiFiProperties nifiProperties) {
+            final ControllerServiceProvider serviceProvider, final KerberosConfig kerberosConfig) {
         this.id = id;
         this.name = name;
         this.schedulingPeriod = schedulingPeriod;
         this.serviceProvider = serviceProvider;
         this.schedulingStrategy = schedulingStrategy;
         this.logger = logger;
-        this.nifiProperties = nifiProperties;
+        this.kerberosConfig = kerberosConfig;
     }
 
     @Override
@@ -135,17 +135,17 @@ public class TransactionalReportingInitializationContext implements ReportingIni
 
     @Override
     public String getKerberosServicePrincipal() {
-        return nifiProperties.getKerberosServicePrincipal();
+        return kerberosConfig.getPrincipal();
     }
 
     @Override
     public File getKerberosServiceKeytab() {
-        return new File(nifiProperties.getKerberosServiceKeytabLocation());
+        return kerberosConfig.getKeytabLocation();
     }
 
     @Override
     public File getKerberosConfigurationFile() {
-        return nifiProperties.getKerberosConfigurationFile();
+        return kerberosConfig.getConfigFile();
     }
 
     @Override

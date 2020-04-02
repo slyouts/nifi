@@ -16,21 +16,27 @@
  */
 package org.apache.nifi.transactional.core;
 
-import org.apache.nifi.parameter.ParameterLookup;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Set;
+
 import org.apache.nifi.attribute.expression.language.PreparedQuery;
 import org.apache.nifi.attribute.expression.language.Query;
 import org.apache.nifi.attribute.expression.language.StandardPropertyValue;
-import org.apache.nifi.cluster.protocol.NodeIdentifier;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.PropertyValue;
 import org.apache.nifi.components.state.StateManager;
 import org.apache.nifi.connectable.Connectable;
 import org.apache.nifi.controller.ControllerService;
 import org.apache.nifi.controller.ControllerServiceLookup;
-import org.apache.nifi.controller.FlowController;
 import org.apache.nifi.controller.flow.FlowManager;
 import org.apache.nifi.controller.service.ControllerServiceProvider;
 import org.apache.nifi.events.BulletinFactory;
+import org.apache.nifi.parameter.ParameterLookup;
 import org.apache.nifi.registry.VariableRegistry;
 import org.apache.nifi.reporting.Bulletin;
 import org.apache.nifi.reporting.BulletinRepository;
@@ -38,12 +44,6 @@ import org.apache.nifi.reporting.EventAccess;
 import org.apache.nifi.reporting.ReportingContext;
 import org.apache.nifi.reporting.ReportingTask;
 import org.apache.nifi.reporting.Severity;
-
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.Map;
-import java.util.Set;
 
 public class TransactionalReportingContext implements ReportingContext, ControllerServiceLookup {
 
@@ -55,22 +55,23 @@ public class TransactionalReportingContext implements ReportingContext, Controll
     private final Map<PropertyDescriptor, PreparedQuery> preparedQueries;
     private final VariableRegistry variableRegistry;
     private final ParameterLookup parameterLookup;
-    private final boolean analyticsEnabled;
     private final FlowManager flowManager;
+    private final StateManager stateManager;
 
     public TransactionalReportingContext(final FlowManager flowManager, final BulletinRepository bulletinRepository,
-                                    final Map<PropertyDescriptor, String> properties, final ReportingTask reportingTask,
-                                    final VariableRegistry variableRegistry, final ParameterLookup parameterLookup) {
+            final Map<PropertyDescriptor, String> properties, final ReportingTask reportingTask, final VariableRegistry variableRegistry,
+            final ParameterLookup parameterLookup, final ControllerServiceProvider serviceProvider, final EventAccess eventAccess,
+            final StateManager stateManager) {
         this.flowManager = flowManager;
         this.eventAccess = eventAccess;
         this.bulletinRepository = bulletinRepository;
         this.properties = Collections.unmodifiableMap(properties);
-        this.serviceProvider = flowController.getControllerServiceProvider();
+        this.serviceProvider = serviceProvider;
         this.reportingTask = reportingTask;
         this.variableRegistry = variableRegistry;
         this.parameterLookup = parameterLookup;
-        this.analyticsEnabled = flowController.getStatusAnalyticsEngine() != null;
         preparedQueries = new HashMap<>();
+        this.stateManager = stateManager;
 
         for (final Map.Entry<PropertyDescriptor, String> entry : properties.entrySet()) {
             final PropertyDescriptor desc = entry.getKey();
@@ -101,7 +102,7 @@ public class TransactionalReportingContext implements ReportingContext, Controll
 
     @Override
     public Bulletin createBulletin(final String componentId, final String category, final Severity severity, final String message) {
-        final Connectable connectable = flowController.getFlowManager().findConnectable(componentId);
+        final Connectable connectable = flowManager.findConnectable(componentId);
         if (connectable == null) {
             throw new IllegalStateException("Cannot create Component-Level Bulletin because no component can be found with ID " + componentId);
         }
@@ -115,7 +116,7 @@ public class TransactionalReportingContext implements ReportingContext, Controll
 
     @Override
     public Map<String, String> getAllProperties() {
-        final Map<String,String> propValueMap = new LinkedHashMap<>();
+        final Map<String, String> propValueMap = new LinkedHashMap<>();
         for (final Map.Entry<PropertyDescriptor, String> entry : getProperties().entrySet()) {
             propValueMap.put(entry.getKey().getName(), entry.getValue());
         }
@@ -130,7 +131,8 @@ public class TransactionalReportingContext implements ReportingContext, Controll
         }
 
         final String configuredValue = properties.get(property);
-        return new StandardPropertyValue(configuredValue == null ? descriptor.getDefaultValue() : configuredValue, this, parameterLookup, preparedQueries.get(property), variableRegistry);
+        return new StandardPropertyValue(configuredValue == null ? descriptor.getDefaultValue() : configuredValue, this, parameterLookup,
+                preparedQueries.get(property), variableRegistry);
     }
 
     @Override
@@ -170,22 +172,26 @@ public class TransactionalReportingContext implements ReportingContext, Controll
 
     @Override
     public StateManager getStateManager() {
-        return flowController.getStateManagerProvider().getStateManager(reportingTask.getIdentifier());
+        return this.stateManager;
     }
 
     @Override
     public boolean isClustered() {
-        return flowController.isConfiguredForClustering();
+        return true;
     }
 
     @Override
     public String getClusterNodeIdentifier() {
-        final NodeIdentifier nodeId = flowController.getNodeId();
-        return nodeId == null ? null : nodeId.getId();
+        try {
+            String id = InetAddress.getLocalHost().getCanonicalHostName();
+            return id;
+        } catch (UnknownHostException e) {
+            return null;
+        }
     }
 
     @Override
     public boolean isAnalyticsEnabled() {
-        return this.analyticsEnabled;
+        return false;
     }
 }

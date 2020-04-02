@@ -106,8 +106,10 @@ import org.apache.nifi.controller.service.ControllerServiceLoader;
 import org.apache.nifi.controller.service.ControllerServiceNode;
 import org.apache.nifi.controller.service.ControllerServiceProvider;
 import org.apache.nifi.controller.state.manager.StandardStateManagerProvider;
+import org.apache.nifi.controller.status.history.ComponentStatusRepository;
 import org.apache.nifi.encrypt.StringEncryptor;
 import org.apache.nifi.engine.FlowEngine;
+import org.apache.nifi.events.BulletinFactory;
 import org.apache.nifi.events.VolatileBulletinRepository;
 import org.apache.nifi.flowfile.FlowFilePrioritizer;
 import org.apache.nifi.groups.ProcessGroup;
@@ -153,13 +155,16 @@ import org.w3c.dom.NodeList;
 import org.xml.sax.SAXException;
 import org.apache.nifi.nar.ExtensionManager;
 import org.apache.nifi.nar.NarCloseable;
+import org.apache.nifi.nar.NarThreadContextClassLoader;
 import org.apache.nifi.parameter.Parameter;
 import org.apache.nifi.parameter.ParameterContext;
 import org.apache.nifi.parameter.ParameterContextManager;
 import org.apache.nifi.parameter.ParameterDescriptor;
 import org.apache.nifi.parameter.ParameterLookup;
 import org.apache.nifi.parameter.StandardParameterContextManager;
+import org.apache.nifi.processor.Processor;
 import org.apache.nifi.processor.Relationship;
+import org.apache.nifi.provenance.ProvenanceRepository;
 import org.apache.nifi.registry.ComponentVariableRegistry;
 import org.apache.nifi.registry.VariableDescriptor;
 import org.apache.nifi.registry.VariableRegistry;
@@ -185,6 +190,7 @@ import org.apache.nifi.remote.protocol.SiteToSiteTransportProtocol;
 import org.apache.nifi.reporting.BulletinRepository;
 import org.apache.nifi.reporting.InitializationException;
 import org.apache.nifi.reporting.ReportingTask;
+import org.apache.nifi.reporting.Severity;
 import org.apache.nifi.scheduling.ExecutionNode;
 import org.apache.nifi.scheduling.SchedulingStrategy;
 import org.apache.nifi.security.util.SslContextFactory;
@@ -225,93 +231,48 @@ public class TransactionalFlow implements RunnableFlow {
     static final ParameterContext EMPTY_PC = new TransactionalParameterContext("0", "controller", Collections.emptyMap());
 
     private static final Logger logger = LoggerFactory.getLogger(TransactionalFlow.class);
-
-    private TransactionalComponent sourceComponent = null;
-
-    private StateManagerProvider stateManagerProvider;
+    private static final String DEFAULT_PROVENANCE_REPO_IMPLEMENTATION = "org.apache.nifi.provenance.VolatileProvenanceRepository";
 
     public TransactionalFlow(TransactionalFlowManager flowManager, ExtensionManager extensionManager, SSLContext sslContext,
             Map<String, ParameterContext> paramaterContexts, StateManagerProvider stateManagerProvider, VariableRegistry baseVarRegistry,
             StringEncryptor encryptor) {
 
-        final Map<String, VersionedProcessor> processors = findProcessorsRecursive(flow).stream()
-                .collect(Collectors.toMap(VersionedProcessor::getIdentifier, proc -> proc));
+        TransactionalProcessGroup rootGroup = flowManager.getRootGroup();
+        final Map<String, ProcessorNode> processors = findProcessorsRecursive(rootGroup).stream()
+                .collect(Collectors.toMap(ProcessorNode::getIdentifier, proc -> proc));
 
-        final Map<String, VersionedRemoteProcessGroup> rpgs = new HashMap<>();
-        final Map<String, VersionedRemoteGroupPort> remotePorts = new HashMap<>();
-        findRemoteGroupRecursive(flow, rpgs, remotePorts);
+        final Map<String, RemoteProcessGroup> rpgs = new HashMap<>();
+        final Map<String, RemoteGroupPort> remotePorts = new HashMap<>();
+        findRemoteGroupRecursive(rootGroup, rpgs, remotePorts);
 
-        final Set<VersionedConnection> connections = findConnectionsRecursive(flow);
-        final Set<VersionedPort> inputPorts = flow.getInputPorts();
-
-        if (inputPorts.size() > 1) {
-            throw new IllegalArgumentException("Only one input port per flow is allowed");
-        }
-
-        final TransactionalControllerServiceLookup serviceLookup = new TransactionalControllerServiceLookup(parameterContext);
-
-        final Set<VersionedControllerService> controllerServices = flow.getControllerServices();
-        for (final VersionedControllerService versionedControllerService : controllerServices) {
-            final StateManager stateManager = new StatelessStateManager();
-
-            final ControllerService service = componentFactory.createControllerService(versionedControllerService, variableRegistry, serviceLookup,
-                    stateManager, parameterContext);
-            serviceLookup.addControllerService(service, versionedControllerService.getName());
-            serviceLookup.setControllerServiceAnnotationData(service, versionedControllerService.getAnnotationData());
-
-            final SLF4JComponentLog logger = new SLF4JComponentLog(service);
-            final TransactionalProcessContext processContext = new TransactionalProcessContext(service, serviceLookup,
-                    versionedControllerService.getName(), logger, stateManager, variableRegistry, parameterContext, encryptor);
-
-            final Map<String, String> versionedPropertyValues = versionedControllerService.getProperties();
-            for (final Map.Entry<String, String> entry : versionedPropertyValues.entrySet()) {
-                final String propertyName = entry.getKey();
-                final String propertyValue = entry.getValue();
-                final PropertyDescriptor descriptor = service.getPropertyDescriptor(propertyName);
-
-                serviceLookup.setControllerServiceProperty(service, descriptor, processContext, variableRegistry, propertyValue);
-            }
-
-            for (final PropertyDescriptor descriptor : service.getPropertyDescriptors()) {
-                final String versionedPropertyValue = versionedPropertyValues.get(descriptor.getName());
-                if (versionedPropertyValue == null && descriptor.getDefaultValue() != null) {
-                    serviceLookup.setControllerServiceProperty(service, descriptor, processContext, variableRegistry, descriptor.getDefaultValue());
-                }
-            }
-        }
-
-        serviceLookup.enableControllerServices(variableRegistry);
-
-        final Map<String, TransactionalComponent> componentMap = new HashMap<>();
-        for (final VersionedConnection connection : connections) {
+        final Set<Connection> connections = findConnectionsRecursive(rootGroup);
+        
+        final Map<String, Connectable> componentMap = new HashMap<>();
+        for (final Connection connection : connections) {
             boolean isInputPortConnection = false;
 
-            final ConnectableComponent source = connection.getSource();
-            final ConnectableComponent destination = connection.getDestination();
+            final Connectable source = connection.getSource();
+            final Connectable destination = connection.getDestination();
 
-            TransactionalComponent sourceComponent = null;
-            if (componentMap.containsKey(source.getId())) {
-                sourceComponent = componentMap.get(source.getId());
+            Connectable sourceComponent = null;
+            if (componentMap.containsKey(source.getIdentifier())) {
+                sourceComponent = componentMap.get(source.getIdentifier());
             } else {
-                switch (source.getType()) {
+                switch (source.getConnectableType()) {
                 case PROCESSOR:
-                    final VersionedProcessor processor = processors.get(source.getId());
+                    final ProcessorNode processor = processors.get(source.getIdentifier());
 
                     if (processor == null) {
-                        throw new IllegalArgumentException("Unknown input processor. " + source.getId());
+                        throw new IllegalArgumentException("Unknown input processor. " + source.getIdentifier());
                     } else {
-                        sourceComponent = componentFactory.createProcessor(processor, serviceLookup, variableRegistry, null, parameterContext);
-                        componentMap.put(source.getId(), sourceComponent);
+                        componentMap.put(source.getIdentifier(), processor);
                     }
                     break;
                 case REMOTE_INPUT_PORT:
-                    throw new IllegalArgumentException("Unsupported source type: " + source.getType());
+                    throw new IllegalArgumentException("Unsupported source type: " + source.getConnectableType());
                 case REMOTE_OUTPUT_PORT:
-                    final VersionedRemoteGroupPort remotePort = remotePorts.get(source.getId());
-                    final VersionedRemoteProcessGroup rpg = rpgs.get(remotePort.getRemoteGroupId());
-
-                    sourceComponent = new StatelessRemoteOutputPort(rpg, remotePort, sslContext);
-                    componentMap.put(source.getId(), sourceComponent);
+                    final RemoteGroupPort remotePort = remotePorts.get(source.getIdentifier());
+                    componentMap.put(source.getIdentifier(), remotePort);
                     break;
                 case OUTPUT_PORT:
                 case FUNNEL:
@@ -412,36 +373,37 @@ public class TransactionalFlow implements RunnableFlow {
         roots = componentMap.values().stream().filter(statelessComponent -> statelessComponent.getParents().isEmpty()).collect(Collectors.toList());
     }
 
-    private Set<VersionedProcessor> findProcessorsRecursive(final VersionedProcessGroup group) {
-        final Set<VersionedProcessor> processors = new HashSet<>();
+    private Set<ProcessorNode> findProcessorsRecursive(final TransactionalProcessGroup group) {
+        final Set<ProcessorNode> processors = new HashSet<>();
         findProcessorsRecursive(group, processors);
         return processors;
     }
 
-    private void findProcessorsRecursive(final VersionedProcessGroup group, final Set<VersionedProcessor> processors) {
+    private void findProcessorsRecursive(final ProcessGroup group, final Set<ProcessorNode> processors) {
         processors.addAll(group.getProcessors());
         group.getProcessGroups().forEach(child -> findProcessorsRecursive(child, processors));
     }
 
-    private Set<VersionedConnection> findConnectionsRecursive(final VersionedProcessGroup group) {
-        final Set<VersionedConnection> connections = new HashSet<>();
-        findConnectionsRecursive(group, connections);
+    private Set<Connection> findConnectionsRecursive(final TransactionalProcessGroup rootGroup) {
+        final Set<Connection> connections = new HashSet<>();
+        findConnectionsRecursive(rootGroup, connections);
         return connections;
     }
 
-    private void findConnectionsRecursive(final VersionedProcessGroup group, final Set<VersionedConnection> connections) {
+    private void findConnectionsRecursive(final ProcessGroup group, final Set<Connection> connections) {
         connections.addAll(group.getConnections());
         group.getProcessGroups().forEach(child -> findConnectionsRecursive(child, connections));
     }
-
-    private void findRemoteGroupRecursive(final VersionedProcessGroup group, final Map<String, VersionedRemoteProcessGroup> rpgs,
-            final Map<String, VersionedRemoteGroupPort> ports) {
-        for (final VersionedRemoteProcessGroup rpg : group.getRemoteProcessGroups()) {
+    
+    private void findRemoteGroupRecursive(final ProcessGroup group, final Map<String, RemoteProcessGroup> rpgs,
+            final Map<String, RemoteGroupPort> ports) {
+        for (final RemoteProcessGroup rpg : group.getRemoteProcessGroups()) {
             rpgs.put(rpg.getIdentifier(), rpg);
 
             rpg.getInputPorts().forEach(port -> ports.put(port.getIdentifier(), port));
             rpg.getOutputPorts().forEach(port -> ports.put(port.getIdentifier(), port));
         }
+        group.getProcessGroups().forEach(child -> findRemoteGroupRecursive(child, rpgs, ports));
     }
 
     public boolean run(final Queue<TransactionalFlowFile> output) {
@@ -591,7 +553,6 @@ public class TransactionalFlow implements RunnableFlow {
             throws InitializationException, IOException, ProcessorInstantiationException, NiFiRegistryException {
 
         // Get flow config file location from props
-        File flowConfigFile = properties.getFlowConfigurationFile();
         final String algorithm = properties.getProperty(NiFiProperties.SENSITIVE_PROPS_ALGORITHM);
         final String provider = properties.getProperty(NiFiProperties.SENSITIVE_PROPS_PROVIDER);
         final String password = properties.getProperty(NiFiProperties.SENSITIVE_PROPS_KEY);
@@ -634,21 +595,35 @@ public class TransactionalFlow implements RunnableFlow {
                     extensionManager, properties);
 
             BulletinRepository bulletinRepo = new VolatileBulletinRepository();
-            TransactionalControllerServiceProvider serviceProvider = new TransactionalControllerServiceProvider(extensionManager, scheduler, bulletinRepo);
+            TransactionalControllerServiceProvider serviceProvider = new TransactionalControllerServiceProvider(extensionManager, scheduler,
+                    bulletinRepo);
             FlowFileEventRepository flowFileEventRepository = new RingBufferEventRepository(5);
+
             TransactionalReloadComponent reloadComponent = new TransactionalReloadComponent(extensionManager, baseVarRegistry, serviceProvider,
                     stateManagerProvider, validationTrigger, encryptor);
             ParameterContextManager parameterContextManager = new StandardParameterContextManager();
+
             TransactionalFlowManager flowManager = new TransactionalFlowManager(properties, sslContext, extensionManager, scheduler,
                     stateManagerProvider, baseVarRegistry, flowFileEventRepository, parameterContextManager, serviceProvider, validationTrigger,
                     reloadComponent, kerberosConfig);
+
+            final String implementationClassName = properties.getProperty(NiFiProperties.PROVENANCE_REPO_IMPLEMENTATION_CLASS,
+                    DEFAULT_PROVENANCE_REPO_IMPLEMENTATION);
+            if (implementationClassName == null) {
+                throw new RuntimeException("Cannot create Provenance Repository because the NiFi Properties is missing the following property: "
+                        + NiFiProperties.PROVENANCE_REPO_IMPLEMENTATION_CLASS);
+            }
+
+            ProvenanceRepository provRepo = NarThreadContextClassLoader.createInstance(extensionManager, implementationClassName,
+                    ProvenanceRepository.class, properties);
+            final TransactionalEventAccess eventAccess = new TransactionalEventAccess(flowManager, flowFileEventRepository, provRepo, scheduler);
 
             final Element parameterContextsElement = DomUtils.getChild(rootElement, "parameterContexts");
             Map<String, ParameterContext> paramaterContexts = new HashMap<>();
             if (parameterContextsElement != null) {
                 final List<Element> contextElements = DomUtils.getChildElementsByTagName(parameterContextsElement, "parameterContext");
                 for (final Element contextElement : contextElements) {
-                    Map<String, Parameter> parameters;
+                    Map<String, Parameter> parameters = new HashMap<>();
                     String paramContextID = DomUtils.getChildText(contextElement, "id");
                     String paramContextName = DomUtils.getChildText(contextElement, "name");
                     List<Element> params = DomUtils.getChildElementsByTagName(contextElement, "parameter");
@@ -672,8 +647,7 @@ public class TransactionalFlow implements RunnableFlow {
             final Element rootGroupElement = (Element) rootElement.getElementsByTagName("rootGroup").item(0);
 
             // get the process groups...this recurses down through the child ProcessGroups
-            final TransactionalProcessGroup rootGroup = addProcessGroup(flowManager, null, rootGroupElement, encryptor, encodingVersion,
-                    serviceProvider, extensionManager);
+            addProcessGroup(flowManager, null, rootGroupElement, encryptor, encodingVersion, serviceProvider, extensionManager);
 
             // need to build the controller level controller services...these are the ones used by ReportingTasks
             final Element controllerServicesElement = DomUtils.getChild(rootElement, "controllerServices");
@@ -701,137 +675,51 @@ public class TransactionalFlow implements RunnableFlow {
                 }
             }
 
-            final Element reportingTasksElement = DomUtils.getChild(rootElement, "reportingTasks");
-            final List<ReportingTaskDTO> taskElements;
-            if (reportingTasksElement != null) {
-                DomUtils.getChildElementsByTagName(reportingTasksElement, "reportingTask")
-                        .forEach(rte -> taskElements.add(FlowFromDOMFactory.getReportingTask(rte, encryptor, encodingVersion)));
-                taskElements.forEach(rtDTO -> {
-                    StateManager stateManager = stateManagerProvider.getStateManager(rtDTO.getId());
-                    String type = rtDTO.getType();
-                    BundleDTO bundleDTO = rtDTO.getBundle();
-                    BundleCoordinate bundleCoordinate = new BundleCoordinate(bundleDTO.getGroup(), bundleDTO.getArtifact(), bundleDTO.getVersion());
-                    ReportingTaskNode reportingTask = flowManager.createReportingTask(type, bundleCoordinate, true);
-                    reportingTask.setName(rtDTO.getName());
-                    reportingTask.setComments(rtDTO.getComments());
-                    reportingTask.setSchedulingPeriod(rtDTO.getSchedulingPeriod());
-                    reportingTask.setSchedulingStrategy(SchedulingStrategy.valueOf(rtDTO.getSchedulingStrategy()));
-                    reportingTask.setAnnotationData(rtDTO.getAnnotationData());
-                    reportingTask.setProperties(rtDTO.getProperties());
-                });
-            }
             Collection<ControllerServiceNode> services = flowManager.getRootControllerServices();
             services.forEach(ControllerServiceNode::performValidation); // validate services before attempting to enable them
             serviceProvider.enableControllerServices(services);
 
+            final Element reportingTasksElement = DomUtils.getChild(rootElement, "reportingTasks");
+            final List<ReportingTaskDTO> taskElements = new ArrayList<>();
+            if (reportingTasksElement != null) {
+                DomUtils.getChildElementsByTagName(reportingTasksElement, "reportingTask")
+                        .forEach(rte -> taskElements.add(FlowFromDOMFactory.getReportingTask(rte, encryptor, encodingVersion)));
+                taskElements.forEach(rtDTO -> {
+                    String type = rtDTO.getType();
+                    BundleDTO bundleDTO = rtDTO.getBundle();
+                    BundleCoordinate bundleCoordinate = new BundleCoordinate(bundleDTO.getGroup(), bundleDTO.getArtifact(), bundleDTO.getVersion());
+                    ReportingTaskNode reportingTaskNode = flowManager.createReportingTask(type, rtDTO.getId(), bundleCoordinate, null, true, true);
+                    reportingTaskNode.setName(rtDTO.getName());
+                    reportingTaskNode.setComments(rtDTO.getComments());
+                    reportingTaskNode.setSchedulingPeriod(rtDTO.getSchedulingPeriod());
+                    reportingTaskNode.setSchedulingStrategy(SchedulingStrategy.valueOf(rtDTO.getSchedulingStrategy()));
+                    reportingTaskNode.setAnnotationData(rtDTO.getAnnotationData());
+                    reportingTaskNode.setProperties(rtDTO.getProperties());
+
+                    try {
+                        reportingTaskNode.verifyCanStart();
+                        reportingTaskNode.reloadAdditionalResourcesIfNecessary();
+                        scheduler.schedule(reportingTaskNode);
+
+                    } catch (final Exception e) {
+                        logger.error("Failed to start {} due to {}", reportingTaskNode, e);
+                        if (logger.isDebugEnabled()) {
+                            logger.error("", e);
+                        }
+                        bulletinRepo.addBulletin(BulletinFactory.createBulletin("Reporting Tasks", Severity.ERROR.name(),
+                                "Failed to start " + reportingTaskNode + " due to " + e));
+                    }
+
+                });
+            }
+
             final TransactionalFlow flow = new TransactionalFlow(flowManager, extensionManager, sslContext, paramaterContexts, stateManagerProvider,
                     baseVarRegistry, encryptor);
+            return flow;
         } catch (Exception e) {
             throw new FlowSerializationException(e);
         }
 
-        // create ParameterContexts
-        // create Variables
-
-        int flowVersion = -1;
-        if (args.has(FLOWVERSION)) {
-            flowVersion = args.getAsJsonPrimitive(FLOWVERSION).getAsInt();
-        }
-
-        final List<String> failurePorts = new ArrayList<>();
-        if (args.has(FAILUREPORTS)) {
-            args.getAsJsonArray(FAILUREPORTS).forEach(port -> failurePorts.add(port.getAsString()));
-        }
-
-        final VersionedFlowSnapshot snapshot = new RegistryUtil(registryurl, sslContext).getFlowByID(bucketID, flowID, flowVersion);
-
-        final Map<VariableDescriptor, String> inputVariables = new HashMap<>();
-        final VersionedProcessGroup versionedGroup = snapshot.getFlowContents();
-        if (versionedGroup != null) {
-            for (final Map.Entry<String, String> entry : versionedGroup.getVariables().entrySet()) {
-                final String variableName = entry.getKey();
-                final String variableValue = entry.getValue();
-                inputVariables.put(new VariableDescriptor(variableName), variableValue);
-            }
-        }
-
-        final Map<String, Parameter> parameters = new LinkedHashMap<>();
-        final Set<String> parameterNames = new HashSet<>();
-        if (args.has(PARAMETERS)) {
-            final JsonElement parametersElement = args.get(PARAMETERS);
-            final JsonObject parametersObject = parametersElement.getAsJsonObject();
-
-            for (final Map.Entry<String, JsonElement> entry : parametersObject.entrySet()) {
-                final String parameterName = entry.getKey();
-                final JsonElement valueElement = entry.getValue();
-
-                if (parameterNames.contains(parameterName)) {
-                    throw new IllegalStateException("Cannot parse configuration because Parameter '" + parameterName + "' has been defined twice");
-                }
-
-                parameterNames.add(parameterName);
-
-                if (valueElement.isJsonObject()) {
-                    final JsonObject valueObject = valueElement.getAsJsonObject();
-
-                    final boolean sensitive;
-                    if (valueObject.has(PARAMETER_SENSITIVE)) {
-                        sensitive = valueObject.get(PARAMETER_SENSITIVE).getAsBoolean();
-                    } else {
-                        sensitive = false;
-                    }
-
-                    if (valueObject.has(PARAMETER_VALUE)) {
-                        final String value = valueObject.get(PARAMETER_VALUE).getAsString();
-                        final ParameterDescriptor descriptor = new ParameterDescriptor.Builder().name(parameterName).sensitive(sensitive).build();
-                        final Parameter parameter = new Parameter(descriptor, value);
-                        parameters.add(parameter);
-                    } else {
-                        throw new IllegalStateException(
-                                "Cannot parse configuration because Parameter '" + parameterName + "' does not have a value associated with it");
-                    }
-                } else {
-                    final String parameterValue = entry.getValue().getAsString();
-                    final ParameterDescriptor descriptor = new ParameterDescriptor.Builder().name(parameterName).build();
-                    final Parameter parameter = new Parameter(descriptor, parameterValue);
-                    parameters.add(parameter);
-                }
-            }
-        }
-
-        final ParameterContext parameterContext = new TransactionalParameterContext(parameters);
-        final ExtensionManager extensionManager = ExtensionDiscovery.discover(narWorkingDir, systemClassLoader);
-        final TransactionalFlow flow = new TransactionalFlow(snapshot.getFlowContents(), extensionManager, () -> inputVariables, failurePorts,
-                sslContext, parameterContext);
-        flow.enqueueFromJSON(args);
-        return flow;
-    }
-
-    private static Set<URL> getAdditionalClasspathResources(final List<PropertyDescriptor> propertyDescriptors, final String componentId,
-            final Map<String, String> properties, final ParameterLookup parameterLookup, final VariableRegistry variableRegistry,
-            final ComponentLog logger) {
-        final Set<String> modulePaths = new LinkedHashSet<>();
-        for (final PropertyDescriptor descriptor : propertyDescriptors) {
-            if (descriptor.isDynamicClasspathModifier()) {
-                final String value = properties.get(descriptor.getName());
-                if (!StringUtils.isEmpty(value)) {
-                    final StandardPropertyValue propertyValue = new StandardPropertyValue(value, null, parameterLookup, variableRegistry);
-                    modulePaths.add(propertyValue.evaluateAttributeExpressions().getValue());
-                }
-            }
-        }
-
-        final Set<URL> additionalUrls = new LinkedHashSet<>();
-        try {
-            final URL[] urls = ClassLoaderUtils.getURLsForClasspath(modulePaths, null, true);
-            if (urls != null) {
-                additionalUrls.addAll(Arrays.asList(urls));
-            }
-        } catch (MalformedURLException mfe) {
-            logger.error("Error processing classpath resources for " + componentId + ": " + mfe.getMessage(), mfe);
-        }
-
-        return additionalUrls;
     }
 
     private static void checkBundleCompatibility(final Document configuration, ExtensionManager extensionManager) {
@@ -911,18 +799,6 @@ public class TransactionalFlow implements RunnableFlow {
 
         processGroup.setVariables(variables);
 
-        final VersionControlInformationDTO versionControlInfoDto = processGroupDTO.getVersionControlInformation();
-        if (versionControlInfoDto != null) {
-            final String registryName = versionControlInfoDto.getRegistryId();
-            versionControlInfoDto.setState(VersionedFlowState.UP_TO_DATE.name());
-            versionControlInfoDto.setStateExplanation("Process Group is loaded from latest flow.xml");
-            final StandardVersionControlInformation versionControlInformation = StandardVersionControlInformation.Builder
-                    .fromDto(versionControlInfoDto).registryName(registryName).build();
-
-            // pass empty map for the version control mapping because the VersionedComponentId has already been set on the components
-            processGroup.setVersionControlInformation(versionControlInformation, Collections.emptyMap());
-        }
-
         // Add Controller Services
         final List<Element> serviceNodeList = getChildrenByTagName(processGroupElement, "controllerService");
         if (!serviceNodeList.isEmpty()) {
@@ -966,7 +842,7 @@ public class TransactionalFlow implements RunnableFlow {
                 }
             }
 
-            final ProcessorNode procNode = flowManager.createProcessor(processorDTO.getType(), processorDTO.getId(), coordinate, false);
+            final ProcessorNode procNode = flowManager.createProcessor(processorDTO.getType(), processorDTO.getId(), coordinate, true);
             procNode.setVersionedComponentId(processorDTO.getVersionedComponentId());
             processGroup.addProcessor(procNode);
             updateProcessor(procNode, processorDTO, processGroup, flowManager);
@@ -987,23 +863,6 @@ public class TransactionalFlow implements RunnableFlow {
             port.setVersionedComponentId(portDTO.getVersionedComponentId());
             port.setComments(portDTO.getComments());
             port.setProcessGroup(processGroup);
-
-            final Set<String> userControls = portDTO.getUserAccessControl();
-            if (userControls != null && !userControls.isEmpty()) {
-                if (!(port instanceof PublicPort)) {
-                    throw new IllegalStateException(
-                            "Attempting to add User Access Controls to " + port.getIdentifier() + ", but it is not a RootGroupPort");
-                }
-                ((PublicPort) port).setUserAccessControl(userControls);
-            }
-            final Set<String> groupControls = portDTO.getGroupAccessControl();
-            if (groupControls != null && !groupControls.isEmpty()) {
-                if (!(port instanceof PublicPort)) {
-                    throw new IllegalStateException(
-                            "Attempting to add Group Access Controls to " + port.getIdentifier() + ", but it is not a RootGroupPort");
-                }
-                ((PublicPort) port).setGroupAccessControl(groupControls);
-            }
 
             processGroup.addInputPort(port);
             if (portDTO.getConcurrentlySchedulableTaskCount() != null) {
@@ -1063,12 +922,7 @@ public class TransactionalFlow implements RunnableFlow {
             final Funnel funnel = flowManager.createFunnel(funnelDTO.getId());
             funnel.setVersionedComponentId(funnelDTO.getVersionedComponentId());
 
-            // Since this is called during startup, we want to add the funnel without enabling it
-            // and then tell the controller to enable it. This way, if the controller is not fully
-            // initialized, the starting of the funnel is delayed until the controller is ready.
-            processGroup.addFunnel(funnel, false);
-            final ProcessGroup group = requireNonNull(funnel).getProcessGroup();
-            group.startFunnel((Funnel) funnel);
+            processGroup.addFunnel(funnel, true);
         }
 
         // add nested process groups (recursively)
@@ -1186,59 +1040,7 @@ public class TransactionalFlow implements RunnableFlow {
 
             final Connection connection = flowManager.createConnection(dto.getId(), dto.getName(), source, destination,
                     dto.getSelectedRelationships());
-            connection.setVersionedComponentId(dto.getVersionedComponentId());
             connection.setProcessGroup(processGroup);
-
-            final List<Position> bendPoints = new ArrayList<>();
-            for (final PositionDTO bend : dto.getBends()) {
-                bendPoints.add(new Position(bend.getX(), bend.getY()));
-            }
-            connection.setBendPoints(bendPoints);
-
-            final Long zIndex = dto.getzIndex();
-            if (zIndex != null) {
-                connection.setZIndex(zIndex);
-            }
-
-            if (dto.getLabelIndex() != null) {
-                connection.setLabelIndex(dto.getLabelIndex());
-            }
-
-            List<FlowFilePrioritizer> newPrioritizers = null;
-            final List<String> prioritizers = dto.getPrioritizers();
-            if (prioritizers != null) {
-                final List<String> newPrioritizersClasses = new ArrayList<>(prioritizers);
-                newPrioritizers = new ArrayList<>();
-                for (final String className : newPrioritizersClasses) {
-                    try {
-                        newPrioritizers.add(flowManager.createPrioritizer(className));
-                    } catch (final ClassNotFoundException | InstantiationException | IllegalAccessException e) {
-                        throw new IllegalArgumentException("Unable to set prioritizer " + className + ": " + e);
-                    }
-                }
-            }
-            if (newPrioritizers != null) {
-                connection.getFlowFileQueue().setPriorities(newPrioritizers);
-            }
-
-            if (dto.getBackPressureObjectThreshold() != null) {
-                connection.getFlowFileQueue().setBackPressureObjectThreshold(dto.getBackPressureObjectThreshold());
-            }
-            if (dto.getBackPressureDataSizeThreshold() != null) {
-                connection.getFlowFileQueue().setBackPressureDataSizeThreshold(dto.getBackPressureDataSizeThreshold());
-            }
-            if (dto.getFlowFileExpiration() != null) {
-                connection.getFlowFileQueue().setFlowFileExpiration(dto.getFlowFileExpiration());
-            }
-
-            if (dto.getLoadBalanceStrategy() != null) {
-                connection.getFlowFileQueue().setLoadBalanceStrategy(LoadBalanceStrategy.valueOf(dto.getLoadBalanceStrategy()),
-                        dto.getLoadBalancePartitionAttribute());
-            }
-
-            if (dto.getLoadBalanceCompression() != null) {
-                connection.getFlowFileQueue().setLoadBalanceCompression(LoadBalanceCompression.valueOf(dto.getLoadBalanceCompression()));
-            }
 
             processGroup.addConnection(connection);
         }

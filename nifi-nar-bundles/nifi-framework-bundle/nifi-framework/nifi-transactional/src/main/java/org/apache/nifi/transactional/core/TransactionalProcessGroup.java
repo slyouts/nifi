@@ -90,8 +90,6 @@ public class TransactionalProcessGroup implements ProcessGroup {
 
     private String comments;
 
-    private String versionedComponentId;
-
     public TransactionalProcessGroup(TransactionalProcessGroup parent, ProcessGroupDTO element, ComponentVariableRegistry variableRegistry,
             FlowManager flowManager, TransactionalProcessScheduler scheduler) {
         this.parent = parent;
@@ -247,7 +245,6 @@ public class TransactionalProcessGroup implements ProcessGroup {
 
     @Override
     public void setVersionedComponentId(String versionedComponentId) {
-        this.versionedComponentId = versionedComponentId;
     }
 
     @Override

@@ -21,9 +21,10 @@ import java.net.URL;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
+
 import org.apache.commons.lang3.ClassUtils;
-import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.annotation.configuration.DefaultSettings;
 import org.apache.nifi.bundle.Bundle;
 import org.apache.nifi.bundle.BundleCoordinate;
@@ -33,7 +34,6 @@ import org.apache.nifi.components.state.StateManagerProvider;
 import org.apache.nifi.components.validation.ValidationTrigger;
 import org.apache.nifi.controller.ControllerService;
 import org.apache.nifi.controller.ControllerServiceInitializationContext;
-import org.apache.nifi.controller.ControllerServiceLookup;
 import org.apache.nifi.controller.LoggableComponent;
 import org.apache.nifi.controller.NodeTypeProvider;
 import org.apache.nifi.controller.ProcessScheduler;
@@ -44,20 +44,15 @@ import org.apache.nifi.controller.StandardProcessorNode;
 import org.apache.nifi.controller.TerminationAwareLogger;
 import org.apache.nifi.controller.ValidationContextFactory;
 import org.apache.nifi.controller.exception.ProcessorInstantiationException;
+import org.apache.nifi.controller.flow.FlowManager;
 import org.apache.nifi.controller.kerberos.KerberosConfig;
 import org.apache.nifi.controller.reporting.ReportingTaskInstantiationException;
-import org.apache.nifi.controller.reporting.StandardReportingInitializationContext;
-import org.apache.nifi.controller.reporting.StandardReportingTaskNode;
 import org.apache.nifi.controller.service.ControllerServiceInvocationHandler;
-import org.apache.nifi.controller.service.ControllerServiceNode;
 import org.apache.nifi.controller.service.ControllerServiceProvider;
-import org.apache.nifi.controller.service.GhostControllerService;
 import org.apache.nifi.controller.service.StandardControllerServiceInitializationContext;
 import org.apache.nifi.controller.service.StandardControllerServiceInvocationHandler;
-import org.apache.nifi.controller.service.StandardControllerServiceNode;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.nar.ExtensionManager;
-import org.apache.nifi.processor.GhostProcessor;
 import org.apache.nifi.processor.Processor;
 import org.apache.nifi.processor.ProcessorInitializationContext;
 import org.apache.nifi.processor.SimpleProcessLogger;
@@ -66,12 +61,12 @@ import org.apache.nifi.processor.StandardValidationContextFactory;
 import org.apache.nifi.registry.ComponentVariableRegistry;
 import org.apache.nifi.registry.VariableRegistry;
 import org.apache.nifi.registry.variable.StandardComponentVariableRegistry;
-import org.apache.nifi.reporting.GhostReportingTask;
+import org.apache.nifi.reporting.BulletinRepository;
+import org.apache.nifi.reporting.EventAccess;
 import org.apache.nifi.reporting.InitializationException;
 import org.apache.nifi.reporting.ReportingInitializationContext;
 import org.apache.nifi.reporting.ReportingTask;
 import org.apache.nifi.scheduling.SchedulingStrategy;
-import org.apache.nifi.util.NiFiProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -202,7 +197,8 @@ public class ExtensionBuilder {
         return processorNode;
     }
 
-    public ReportingTaskNode buildReportingTask() {
+    public ReportingTaskNode buildReportingTask(FlowManager flowManager, BulletinRepository bulletinRepository, EventAccess eventAccess)
+            throws ReportingTaskInstantiationException {
         if (identifier == null) {
             throw new IllegalStateException("ReportingTask ID must be specified");
         }
@@ -225,20 +221,10 @@ public class ExtensionBuilder {
             throw new IllegalStateException("Reload Component must be specified");
         }
 
-        boolean creationSuccessful = true;
         LoggableComponent<ReportingTask> loggableComponent;
-        try {
-            loggableComponent = createLoggableReportingTask();
-        } catch (final ReportingTaskInstantiationException rtie) {
-            logger.error("Could not create ReportingTask of type " + type + " for ID " + identifier + "; creating \"Ghost\" implementation", rtie);
-            final GhostReportingTask ghostReportingTask = new GhostReportingTask();
-            ghostReportingTask.setIdentifier(identifier);
-            ghostReportingTask.setCanonicalClassName(type);
-            loggableComponent = new LoggableComponent<>(ghostReportingTask, bundleCoordinate, null);
-            creationSuccessful = false;
-        }
+        loggableComponent = createLoggableReportingTask();
 
-        final ReportingTaskNode taskNode = createReportingTaskNode(loggableComponent, creationSuccessful);
+        final ReportingTaskNode taskNode = createReportingTaskNode(loggableComponent, flowManager, bulletinRepository, eventAccess);
         return taskNode;
     }
 
@@ -284,23 +270,16 @@ public class ExtensionBuilder {
         return procNode;
     }
 
-    private ReportingTaskNode createReportingTaskNode(final LoggableComponent<ReportingTask> reportingTask, final boolean creationSuccessful) {
+    private ReportingTaskNode createReportingTaskNode(final LoggableComponent<ReportingTask> reportingTask, FlowManager flowManager,
+            BulletinRepository bulletinRepository, EventAccess eventAccess) {
+        Objects.requireNonNull(eventAccess);
         final ComponentVariableRegistry componentVarRegistry = new StandardComponentVariableRegistry(this.variableRegistry);
         final ValidationContextFactory validationContextFactory = new StandardValidationContextFactory(serviceProvider, componentVarRegistry);
-        final ReportingTaskNode taskNode;
-        if (creationSuccessful) {
-            taskNode = new TransactionalReportingTaskNode(reportingTask, identifier, flowController, processScheduler, validationContextFactory,
-                    componentVarRegistry, reloadComponent, extensionManager, validationTrigger);
-            taskNode.setName(taskNode.getReportingTask().getClass().getSimpleName());
-        } else {
-            final String simpleClassName = type.contains(".") ? StringUtils.substringAfterLast(type, ".") : type;
-            final String componentType = "(Missing) " + simpleClassName;
-
-            taskNode = new TransactionalReportingTaskNode(reportingTask, identifier, flowController, processScheduler, validationContextFactory,
-                    componentType, type, componentVarRegistry, reloadComponent, extensionManager, validationTrigger, true);
-            taskNode.setName(componentType);
-        }
-
+        StateManager stateManager = stateManagerProvider.getStateManager(identifier);
+        final ReportingTaskNode taskNode = new TransactionalReportingTaskNode(reportingTask, identifier, processScheduler, validationContextFactory,
+                componentVarRegistry, reloadComponent, extensionManager, validationTrigger, serviceProvider, flowManager, stateManager,
+                bulletinRepository, eventAccess);
+        taskNode.setName(taskNode.getReportingTask().getClass().getSimpleName());
         return taskNode;
     }
 
@@ -396,8 +375,8 @@ public class ExtensionBuilder {
             final LoggableComponent<ReportingTask> taskComponent = createLoggableComponent(ReportingTask.class);
 
             final String taskName = taskComponent.getComponent().getClass().getSimpleName();
-            final ReportingInitializationContext config = new StandardReportingInitializationContext(identifier, taskName,
-                    SchedulingStrategy.TIMER_DRIVEN, "1 min", taskComponent.getLogger(), serviceProvider, kerberosConfig, nodeTypeProvider);
+            final ReportingInitializationContext config = new TransactionalReportingInitializationContext(identifier, taskName,
+                    SchedulingStrategy.TIMER_DRIVEN, "1 min", taskComponent.getLogger(), serviceProvider, kerberosConfig);
 
             taskComponent.getComponent().initialize(config);
 
