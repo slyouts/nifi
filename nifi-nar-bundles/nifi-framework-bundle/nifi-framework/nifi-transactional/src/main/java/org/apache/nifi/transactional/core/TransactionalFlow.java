@@ -71,6 +71,7 @@ import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.state.StateManager;
 import org.apache.nifi.components.state.StateManagerProvider;
 import org.apache.nifi.components.validation.StandardValidationTrigger;
+import org.apache.nifi.components.validation.ValidationStatus;
 import org.apache.nifi.connectable.Connectable;
 import org.apache.nifi.connectable.ConnectableType;
 import org.apache.nifi.connectable.Connection;
@@ -694,22 +695,18 @@ public class TransactionalFlow implements RunnableFlow {
                     reportingTaskNode.setSchedulingPeriod(rtDTO.getSchedulingPeriod());
                     reportingTaskNode.setSchedulingStrategy(SchedulingStrategy.valueOf(rtDTO.getSchedulingStrategy()));
                     reportingTaskNode.setAnnotationData(rtDTO.getAnnotationData());
-                    reportingTaskNode.setProperties(rtDTO.getProperties());
+                    reportingTaskNode.setProperties(rtDTO.getProperties()); // reloads and adjusts classpath if necessary
 
-                    try {
-                        reportingTaskNode.verifyCanStart();
-                        reportingTaskNode.reloadAdditionalResourcesIfNecessary();
-                        scheduler.schedule(reportingTaskNode);
-
-                    } catch (final Exception e) {
-                        logger.error("Failed to start {} due to {}", reportingTaskNode, e);
-                        if (logger.isDebugEnabled()) {
-                            logger.error("", e);
-                        }
+                });
+                flowManager.getAllReportingTasks().forEach((rtn) -> {
+                    ValidationStatus status = rtn.performValidation();  // should be valid as validation should happen when the data flow is created
+                    if (ValidationStatus.INVALID.equals(status)) {
+                        logger.error("Failed to start {}...invalid Reporting Task", rtn);
                         bulletinRepo.addBulletin(BulletinFactory.createBulletin("Reporting Tasks", Severity.ERROR.name(),
-                                "Failed to start " + reportingTaskNode + " due to " + e));
+                                "Failed to start " + rtn + " due to invalid configuration"));
+                        throw new RuntimeException("Failed to validate " + rtn);
                     }
-
+                    scheduler.schedule(rtn);
                 });
             }
 
