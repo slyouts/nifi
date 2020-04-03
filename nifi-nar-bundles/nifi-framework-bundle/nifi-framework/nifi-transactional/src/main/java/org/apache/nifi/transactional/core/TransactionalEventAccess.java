@@ -25,11 +25,9 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.collections4.Predicate;
-import org.apache.commons.collections4.PredicateUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.action.Action;
 import org.apache.nifi.authorization.resource.Authorizable;
-import org.apache.nifi.authorization.user.NiFiUser;
 import org.apache.nifi.components.validation.ValidationStatus;
 import org.apache.nifi.connectable.Connectable;
 import org.apache.nifi.connectable.ConnectableType;
@@ -39,7 +37,6 @@ import org.apache.nifi.connectable.Port;
 import org.apache.nifi.controller.ProcessScheduler;
 import org.apache.nifi.controller.ProcessorNode;
 import org.apache.nifi.controller.ScheduledState;
-import org.apache.nifi.controller.flow.FlowManager;
 import org.apache.nifi.controller.queue.QueueSize;
 import org.apache.nifi.controller.repository.FlowFileEvent;
 import org.apache.nifi.controller.repository.FlowFileEventRepository;
@@ -60,9 +57,9 @@ import org.apache.nifi.provenance.ProvenanceRepository;
 import org.apache.nifi.registry.flow.VersionControlInformation;
 import org.apache.nifi.remote.PublicPort;
 import org.apache.nifi.remote.RemoteGroupPort;
-import org.apache.nifi.reporting.UserAwareEventAccess;
+import org.apache.nifi.reporting.EventAccess;
 
-public class TransactionalEventAccess implements UserAwareEventAccess {
+public class TransactionalEventAccess implements EventAccess {
     private final FlowFileEventRepository flowFileEventRepository;
     private final TransactionalFlowManager flowManager;
     private final ProvenanceRepository provenanceRepository;
@@ -133,73 +130,6 @@ public class TransactionalEventAccess implements UserAwareEventAccess {
 
     private RepositoryStatusReport generateRepositoryStatusReport() {
         return flowFileEventRepository.reportTransferEvents(System.currentTimeMillis());
-    }
-
-    /**
-     * Returns the status for components in the specified group. This request is made by the specified user so the results will be filtered accordingly.
-     *
-     * @param groupId
-     *            group id
-     * @param user
-     *            user making request
-     * @return the component status
-     */
-    public ProcessGroupStatus getGroupStatus(final String groupId, final NiFiUser user, final int recursiveStatusDepth) {
-        final RepositoryStatusReport repoStatusReport = generateRepositoryStatusReport();
-        return getGroupStatus(groupId, repoStatusReport, user, recursiveStatusDepth);
-    }
-
-    /**
-     * Returns the status for the components in the specified group with the specified report. This request is made by the specified user so the results will be filtered accordingly.
-     *
-     * @param groupId
-     *            group id
-     * @param statusReport
-     *            report
-     * @param user
-     *            user making request
-     * @return the component status
-     */
-    public ProcessGroupStatus getGroupStatus(final String groupId, final RepositoryStatusReport statusReport, final NiFiUser user) {
-        final ProcessGroup group = flowManager.getGroup(groupId);
-
-        // on demand status request for a specific user... require authorization per component and filter results as appropriate
-        return getGroupStatus(group, statusReport, PredicateUtils.truePredicate(), Integer.MAX_VALUE, 1);
-    }
-
-    /**
-     * Returns the status for components in the specified group. This request is made by the specified user so the results will be filtered accordingly.
-     *
-     * @param groupId
-     *            group id
-     * @param user
-     *            user making request
-     * @return the component status
-     */
-    public ProcessGroupStatus getGroupStatus(final String groupId, final NiFiUser user) {
-        final RepositoryStatusReport repoStatusReport = generateRepositoryStatusReport();
-        return getGroupStatus(groupId, repoStatusReport, user);
-    }
-
-    /**
-     * Returns the status for the components in the specified group with the specified report. This request is made by the specified user so the results will be filtered accordingly.
-     *
-     * @param groupId
-     *            group id
-     * @param statusReport
-     *            report
-     * @param user
-     *            user making request
-     * @param recursiveStatusDepth
-     *            the number of levels deep we should recurse and still include the the processors' statuses, the groups' statuses, etc. in the returned ProcessGroupStatus
-     * @return the component status
-     */
-    public ProcessGroupStatus getGroupStatus(final String groupId, final RepositoryStatusReport statusReport, final NiFiUser user,
-            final int recursiveStatusDepth) {
-        final ProcessGroup group = flowManager.getGroup(groupId);
-
-        // on demand status request for a specific user... require authorization per component and filter results as appropriate
-        return getGroupStatus(group, statusReport, PredicateUtils.truePredicate(), recursiveStatusDepth, 1);
     }
 
     /**

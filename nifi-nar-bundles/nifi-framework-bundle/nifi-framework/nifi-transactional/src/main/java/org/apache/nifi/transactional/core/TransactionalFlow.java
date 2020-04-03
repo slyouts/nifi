@@ -709,6 +709,8 @@ public class TransactionalFlow implements RunnableFlow {
                     scheduler.schedule(rtn);
                 });
             }
+            
+            flowManager.getRootGroup().findAllProcessors()
 
             final TransactionalFlow flow = new TransactionalFlow(flowManager, extensionManager, sslContext, paramaterContexts, stateManagerProvider,
                     baseVarRegistry, encryptor);
@@ -866,7 +868,7 @@ public class TransactionalFlow implements RunnableFlow {
                 port.setMaxConcurrentTasks(portDTO.getConcurrentlySchedulableTaskCount());
             }
 
-            final ProcessGroup group = requireNonNull(port).getProcessGroup();
+            final ProcessGroup group = port.getProcessGroup();
             group.startInputPort(port);
         }
 
